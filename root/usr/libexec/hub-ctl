@@ -376,7 +376,7 @@ qb_native_running() {
 }
 
 qb_compose_write() {
-	local f port bt net dir cfgdir dl img
+	local f port bt net dir cfgdir dl img kind
 
 	f=$(qb_compose)
 	port=$(qb_port)
@@ -386,7 +386,17 @@ qb_compose_write() {
 	img=$(qb_image)
 	dl=$(qb_downloads)
 
-	# 配置目录跟着数据目录走：/config 里是 qBittorrent.conf 与 BT_backup，
+	# 两个镜像的约定完全不一样，不能共用一份 compose：
+	#   linuxserver（官方版）  配置挂 /config，端口走 WEBUI_PORT / TORRENTING_PORT
+	#   p3terx（增强版）       配置挂 /qBittorrent，端口走 QBT_WEBUI_PORT，
+	#                          默认值是 28080 —— 不传就一直是 28080
+	# 巧的是两边的 conf 最终都落在 <dir>/config/qBittorrent.conf，页面读的是同一个文件。
+	case "$img" in
+	*p3terx*) kind=p3terx ;;
+	*) kind=lsio ;;
+	esac
+
+	# 配置目录跟着数据目录走：里面是 qBittorrent.conf 与 BT_backup，
 	# 丢了等于把种子和做种记录全丢，必须落在可保留的位置。
 	cfgdir="$dir/config"
 
@@ -414,11 +424,21 @@ qb_compose_write() {
 		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
 		echo "      PUID: '0'"
 		echo "      PGID: '0'"
-		echo "      UMASK: '022'"
-		echo "      WEBUI_PORT: $(yaml_q "$port")"
-		echo "      TORRENTING_PORT: $(yaml_q "$bt")"
+		if [ "$kind" = p3terx ]; then
+			echo "      UMASK_SET: '022'"
+			echo "      QBT_WEBUI_PORT: $(yaml_q "$port")"
+		else
+			echo "      UMASK: '022'"
+			echo "      WEBUI_PORT: $(yaml_q "$port")"
+			echo "      TORRENTING_PORT: $(yaml_q "$bt")"
+		fi
 		echo "    volumes:"
-		echo "      - $(yaml_q "$cfgdir:/config")"
+		if [ "$kind" = p3terx ]; then
+			# p3terx 把 /qBittorrent 当 profile 根，整个数据目录挂进去
+			echo "      - $(yaml_q "$dir:/qBittorrent")"
+		else
+			echo "      - $(yaml_q "$cfgdir:/config")"
+		fi
 		echo "      - $(yaml_q "$dl:/downloads")"
 		# 不挂 /etc/localtime：OpenWrt 上它是符号链接，目标常常不存在，
 		# Docker 建挂载源时 mkdir 已存在的路径会直接 EEXIST。TZ 已经给了。
@@ -775,7 +795,9 @@ qb_start() {
 
 	case "$v" in
 	docker | docker-ee)
-		[ -f "$(qb_compose)" ] || qb_compose_write || return 1
+		# 每次都重写：端口、下载目录、镜像 tag 变了都得让 compose 重算，
+		# 只在文件不存在时写会导致「改了端口容器还在旧端口上」。
+		qb_compose_write || return 1
 		compose "$QBT_CT" "$(qb_compose)" up -d
 		;;
 	*)
@@ -1108,7 +1130,7 @@ ol_start() {
 
 	case "$v" in
 	docker)
-		[ -f "$(ol_compose)" ] || ol_compose_write || return 1
+		ol_compose_write || return 1
 		compose "$OL_CT" "$(ol_compose)" up -d
 		;;
 	*)
