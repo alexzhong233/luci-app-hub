@@ -25,8 +25,8 @@ var TABS = [
 
 /* ---------------------------------------------------------------- 工具 */
 
-function call(tool, args) {
-	return fs.exec(tool, args).then(function(res) {
+function call(tool, args, env) {
+	return fs.exec(tool, args, env).then(function(res) {
 		var text = ((res && res.stdout) || '') + ((res && res.stderr) || '');
 
 		return { code: res ? res.code : 1, text: String(text).replace(/\s+$/, '') };
@@ -116,6 +116,16 @@ return view.extend({
 			});
 		}
 
+		/* 密码通过 fs.exec 的环境参数传，argv 里只有 "-"，ps 看不到明文 */
+		function setPass(svc, pass, label) {
+			setOut('== ' + label + '\n执行中…');
+
+			return call(HUB, [ 'passwd', svc, '-' ], { HUB_PASS: pass }).then(function(r) {
+				setOut('== ' + label + '\n' + r.text);
+				return r;
+			});
+		}
+
 		function saveCfg(sec, kv) {
 			Object.keys(kv).forEach(function(k) {
 				uci.set('hub', sec, k, String(kv[k]));
@@ -156,6 +166,40 @@ return view.extend({
 				onChange(inp.value.trim());
 			});
 			return inp;
+		}
+
+		/* 密码框 + 设置按钮。刻意不带 data-field：不参与草稿收集，
+		 * 免得 5 秒一次的重绘把密码留在 DOM 里。 */
+		function passBox(ph, onSet) {
+			var inp = E('input', {
+				'class': 'cbi-input-text',
+				'type': 'password',
+				'placeholder': ph || '',
+				'autocomplete': 'new-password',
+				'style': 'max-width:16em'
+			});
+			var b = E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'style': 'margin-left:.5em'
+			}, [ '设置' ]);
+
+			b.addEventListener('click', function() {
+				var v = inp.value;
+				if (!v)
+					return;
+				b.disabled = true;
+				Promise.resolve(onSet(v)).then(function() {
+					inp.value = '';
+					b.disabled = false;
+				}, function() {
+					b.disabled = false;
+				});
+			});
+			inp.addEventListener('keydown', function(ev) {
+				if (ev.key === 'Enter')
+					b.click();
+			});
+			return E('span', {}, [ inp, b ]);
 		}
 
 		/*
@@ -237,7 +281,10 @@ return view.extend({
 
 				row('WebUI 端口', E('div', {}, [
 					textBox(val('qb_port', st.qb_port), '8090', function(v) {
-						return saveCfg(sec, { port: v || '8090' });
+						return saveCfg(sec, { port: v || '8090' }).then(function() {
+							if (flag(st.qb_running))
+								return run(HUB, [ 'restart', 'qbittorrent' ], '按新端口重启');
+						});
 					}, 'qb_port'),
 					flag(st.qb_port_busy) ? muted('  已在监听') : null,
 					note('默认 8090。避免用 8080 —— Nikki/mihomo 默认占这个端口。')
@@ -245,7 +292,10 @@ return view.extend({
 
 				row('BT 监听端口', E('div', {}, [
 					textBox(val('qb_bt', st.qb_bt_port), '21142', function(v) {
-						return saveCfg(sec, { bt_port: v || '21142' });
+						return saveCfg(sec, { bt_port: v || '21142' }).then(function() {
+							if (flag(st.qb_running))
+								return run(HUB, [ 'restart', 'qbittorrent' ], '按新端口重启');
+						});
 					}, 'qb_bt'),
 					note('需要在防火墙/端口映射里放行 TCP+UDP。')
 				])),
@@ -259,9 +309,12 @@ return view.extend({
 
 				row('数据目录', E('div', {}, [
 					E('code', {}, [ st.qb_datadir || '' ]),
+					muted(flag(st.qb_datalink)
+						? '  · 原生版已链接到这里，与容器版共用'
+						: '  · 仅在 /etc 上（sda1 不可用）'),
 					note('配置在 ' + (st.qb_config || '') +
 						'，含 qBittorrent.conf 与 BT_backup（种子与做种记录），别丢。' +
-						'留空则优先用 /mnt/sda1，不可用时跟随原生版的 /etc/qBittorrent。')
+						'优先用 /mnt/sda1/Configs/services，安装时会自动把 /etc/qBittorrent 迁过去并换成链接。')
 				])),
 
 				row('容器网络', selectBox(st.qb_network || 'host', [
@@ -271,10 +324,19 @@ return view.extend({
 					return saveCfg(sec, { network: v });
 				})),
 
+				row('WebUI 密码', E('div', {}, [
+					passBox('新密码，留空不改', function(v) {
+						return setPass('qbittorrent', v, '设置 qB 密码');
+					}),
+					note('用户名固定 admin。改完立即生效，不用手动重启。' +
+						'实现方式是先把 127.0.0.1 加进免密白名单、再由本机调 qB 自己的 API，' +
+						'所以以后忘了密码，从路由器本机仍然能改回来；LAN 访问照旧要密码。')
+				])),
+
 				actRow('qbittorrent', running),
 
-				note('提示：原生版和容器版切换时，先「卸载」再选另一种「安装」，' +
-					'否则两个实现会抢同一个端口。数据目录不会被动。')
+				note('提示：原生版和容器版切换时不用先卸载，直接选另一种「安装」就行 —— ' +
+					'ctl 会先停掉另一边并复用同一份数据。')
 			]);
 		}
 
@@ -303,16 +365,24 @@ return view.extend({
 
 				row('端口', E('div', {}, [
 					textBox(val('ol_port', st.ol_port), '5244', function(v) {
-						return saveCfg(sec, { port: v || '5244' });
+						return saveCfg(sec, { port: v || '5244' }).then(function() {
+							if (flag(st.ol_running))
+								return run(HUB, [ 'restart', 'openlist' ], '按新端口重启');
+						});
 					}, 'ol_port'),
-					flag(st.ol_port_busy) ? muted('  已在监听') : null
+					flag(st.ol_port_busy) ? muted('  已在监听') : null,
+					note('原生版会同步到 openlist2 / openlist 自己的 UCI。' +
+						'容器版 host 网络下固定监听 5244，要换宿主机端口请改成 bridge。')
 				])),
 
 				row('数据目录', E('div', {}, [
 					E('code', {}, [ st.ol_datadir || '' ]),
+					muted(flag(st.ol_datalink)
+						? '  · 原生版已链接到这里，三种方式共用'
+						: '  · 仅在 /etc 上（sda1 不可用）'),
 					note('config.json 与 data.db 都在这里。' +
-						'原生 openlist2 用 /etc/openlist2，feeds 版用 /etc/openlist。' +
-						'容器版容器内路径固定为 /opt/openlist/data。')
+						'/etc/openlist2 与 /etc/openlist 会被链接到同一位置，' +
+						'容器版挂载的也是这里（容器内 /opt/openlist/data）。')
 				])),
 
 				row('容器网络', selectBox(st.ol_network || 'host', [
@@ -322,10 +392,18 @@ return view.extend({
 					return saveCfg(sec, { network: v });
 				})),
 
+				row('管理员密码', E('div', {}, [
+					passBox('新密码，留空不改', function(v) {
+						return setPass('openlist', v, '设置 OpenList 密码');
+					}),
+					note('对应 OpenList 面板的 admin 账号，直接写进 data.db，不用重启。' +
+						'容器版通过 docker exec 调用，容器要在运行中。')
+				])),
+
 				actRow('openlist', running),
 
-				note('从原生版切到容器版时，data.db 会被原地接管（同一个目录）。' +
-					'切换前先停服务，避免 SQLite 的 WAL 文件处于写入状态。')
+				note('三种运行方式共用同一份 data.db：原生目录会被链接到上面那个数据目录，' +
+					'切换不用搬文件，也不会丢存储挂载和账号。')
 			]);
 		}
 

@@ -318,6 +318,90 @@ qb_compose_write() {
 	return 0
 }
 
+# ---------------------------------------------------------------- 数据目录统一
+# 原生版的数据位置是包自己定的（qB 是 --profile=/etc 下的 /etc/qBittorrent，
+# openlist2 是 /etc/openlist2，feeds openlist 是 /etc/openlist），容器版挂的却是
+# hub 的 datadir。不处理的话「原生 ↔ 容器」互切就是两套毫不相干的数据，
+# 换一次版本等于换一个空面板。
+#
+# 做法：把原生目录变成指向 datadir 的符号链接，原生和容器从此读写同一份。
+#   /etc/qBittorrent  -> <datadir>/qbittorrent        （容器挂 <datadir>/qbittorrent/config:/config）
+#   /etc/openlist2    -> <datadir>/openlist
+#   /etc/openlist     -> <datadir>/openlist           （容器挂 <datadir>/openlist:/opt/openlist/data）
+# 目录层级天然对齐：qB 原生读 <dir>/config/qBittorrent.conf，容器读 /config/…；
+# OpenList 原生读 <dir>/data.db，容器读 /opt/openlist/data/data.db。
+
+# 把 src 合并进 dst，dst 里已有的文件保持不动（用户数据优先）
+merge_into() {
+	local src="$1" dst="$2" f base
+	[ -d "$src" ] || return 0
+	mkdir -p "$dst" || return 1
+	for f in "$src"/* "$src"/.[!.]*; do
+		[ -e "$f" ] || continue
+		base=${f##*/}
+		if [ -d "$f" ]; then
+			merge_into "$f" "$dst/$base" || return 1
+		elif [ ! -e "$dst/$base" ]; then
+			cp -a "$f" "$dst/" 2>/dev/null
+		fi
+	done
+	return 0
+}
+
+# 是否该做链接：显式配了 datadir，或者 /mnt/sda1 可用
+datalink_needed() {
+	[ -n "$(cfg "$1.datadir")" ] || is_mnt_ok
+}
+
+# 装包前摘掉链接：apk 解包时会往 /etc/openlist2 里写初始 data.db，
+# 若那里还是符号链接，就写穿到用户在 /mnt 上的真实库了。
+# 数据本来就在 datadir 里，摘掉链接不丢东西，装完由 link_datadir 重建。
+unlink_datadir() {
+	local native="$1"
+	[ -L "$native" ] || return 0
+	rm -f "$native" && echo "-- 暂时摘掉 $native 的链接"
+	return 0
+}
+
+# link_datadir <svc> <原生目录>
+link_datadir() {
+	local svc="$1" native="$2" dir cur
+
+	datalink_needed "$svc" || return 0
+	dir=$(svc_datadir "$svc")
+	[ -n "$dir" ] || return 1
+	# datadir 就是原生路径本身（sda1 没挂且没配 datadir），没什么可链的
+	[ "$dir" = "$native" ] && return 0
+
+	# apk 解包时如果这里还是符号链接，包里的初始 data.db 会写穿到真实数据上。
+	# 所以装包之前先摘链接，装完再由这里重建 —— 调用点都在 install 之后。
+	mkdir -p "$dir" || return 1
+
+	if [ -L "$native" ]; then
+		cur=$(readlink "$native" 2>/dev/null)
+		if [ "$cur" != "$dir" ]; then
+			echo "-- $native 原本指向 $cur，改指 $dir"
+			ln -sfn "$dir" "$native"
+		fi
+		return 0
+	fi
+
+	if [ -d "$native" ]; then
+		if [ -n "$(ls -A "$native" 2>/dev/null)" ]; then
+			echo "-- 迁移 $native → $dir（同名文件以 $dir 为准）"
+			merge_into "$native" "$dir" || {
+				echo "!! 迁移失败，保留原目录不动" >&2
+				return 1
+			}
+		fi
+		rm -rf "$native" || return 1
+	fi
+
+	ln -sfn "$dir" "$native" || return 1
+	echo "-- $native -> $dir"
+	return 0
+}
+
 qb_stop_all() {
 	[ -x /etc/init.d/qbittorrent ] && /etc/init.d/qbittorrent stop >/dev/null 2>&1
 	ct_running "$QBT_CT" && docker stop "$QBT_CT" >/dev/null 2>&1
@@ -332,10 +416,19 @@ qb_worker_install() {
 	v=$(qb_variant)
 	set_phase "installing:$v"
 
+	# 先停干净再把数据目录统一到 datadir：容器版随后直接读这份，
+	# 原生版装完读的是同一个位置（符号链接）。
+	qb_stop_all
+	link_datadir qbittorrent /etc/qBittorrent || {
+		set_phase "error:统一数据目录失败（/etc/qBittorrent）"
+		return 1
+	}
+
 	case "$v" in
 	luci)
 		echo "== 原生官方版"
 		qb_stop_all
+		unlink_datadir /etc/qBittorrent
 		pkg_installed qbittorrent-enhanced-edition && pkg_del qbittorrent-enhanced-edition
 		pkg_add qbittorrent || {
 			set_phase "error:安装 qbittorrent 失败"
@@ -345,6 +438,7 @@ qb_worker_install() {
 	luci-ee)
 		echo "== 原生增强版"
 		qb_stop_all
+		unlink_datadir /etc/qBittorrent
 		pkg_installed qbittorrent && pkg_del qbittorrent
 		pkg_add qbittorrent-enhanced-edition || {
 			set_phase "error:安装 qbittorrent-enhanced-edition 失败"
@@ -374,14 +468,170 @@ qb_worker_install() {
 	esac
 
 	# 把变体写进 uci，下次打开页面能对上
+	# 装完再链一次：包管理器可能把原生目录又建成了实体目录
+	link_datadir qbittorrent /etc/qBittorrent >/dev/null 2>&1
+
 	save_cfg qbittorrent "variant=$v"
 	set_phase "done"
 	echo "== 完成"
 }
 
+# 把 hub 里配的端口写进各包自己的配置。
+# hub 的 UCI 是 hub 的，qB 和 OpenList 的 init 读的是它们自己的段，
+# 不同步的话页面上改端口只是改了个没人看的数字。
+qb_sync_port() {
+	local conf port bt
+
+	# qB 原生版：init 每次启动都会用 qbittorrent.config.http_port 覆盖 conf
+	if uci -q get qbittorrent.config >/dev/null 2>&1; then
+		uci -q set "qbittorrent.config.http_port=$(qb_port)"
+		uci -q commit qbittorrent
+	fi
+
+	# BT 监听端口不在 UCI 里，只能改 conf 的 Session\Port
+	conf="$(qb_datadir)/config/qBittorrent.conf"
+	[ -f "$conf" ] || return 0
+	port=$(qb_port)
+	bt=$(qb_bt_port)
+	awk -v p="$port" -v b="$bt" '
+		/^WebUI\\Port=/   { print "WebUI\\Port=" p; next }
+		/^Session\\Port=/ { print "Session\\Port=" b; next }
+		{ print }
+	' "$conf" >"$conf.hubnew" 2>/dev/null || {
+		rm -f "$conf.hubnew"
+		return 0
+	}
+	mv -f "$conf.hubnew" "$conf"
+	return 0
+}
+
+# OpenList 两个原生包的 UCI 键名不同：openlist2 是 port，
+# feeds 版是 listen_http_port（生成 config.json 时用）。
+ol_sync_port() {
+	local port
+
+	port=$(ol_port)
+	if uci -q get openlist2.config >/dev/null 2>&1; then
+		uci -q set "openlist2.config.port=$port"
+		uci -q commit openlist2
+	fi
+	if uci -q get openlist.config >/dev/null 2>&1; then
+		uci -q set "openlist.config.listen_http_port=$port"
+		uci -q commit openlist
+	fi
+	return 0
+}
+
+# 设置 qB 的 WebUI 密码。
+#
+# 不直接写 PBKDF2：那个格式是 @ByteArray(<salt>:<hash>)，要 100000 轮
+# PBKDF2-HMAC-SHA512，shell 里算不出来（openssl kdf 输出的是 hex，转二进制
+# 还得绕一圈）。改用 qB 自己的 API：先把 127.0.0.1 加进免密白名单，
+# 本机调 setPreferences 就能改密码，qB 自己生成 hash。
+#
+# 白名单留着是好事：以后忘了密码，从路由器本机还能进去改，LAN 访问照样要密码。
+qb_set_password() {
+	local pass="$1" port conf i
+
+	# 页面走环境变量传密码（fs.exec 的第三个参数），argv 里只有 "-"，
+	# 不会被 ps 看到；命令行手动用时仍然可以直接把密码写在参数里。
+	[ "$pass" = "-" ] && pass="$HUB_PASS"
+
+	[ -n "$pass" ] || {
+		echo "!! 密码不能为空" >&2
+		return 1
+	}
+	port=$(qb_port)
+	conf="$(qb_datadir)/config/qBittorrent.conf"
+
+	mkdir -p "${conf%/*}" || return 1
+	[ -f "$conf" ] || printf '[LegalNotice]\nAccepted=true\n' >"$conf"
+
+	qb_stop_all
+
+	# 本机免密
+	if grep -q '^\[Preferences\]' "$conf"; then
+		if grep -q '^WebUI\\AuthSubnetWhitelistEnabled=' "$conf"; then
+			sed -i 's|^WebUI\\AuthSubnetWhitelistEnabled=.*|WebUI\\AuthSubnetWhitelistEnabled=true|' "$conf"
+		else
+			sed -i '/^\[Preferences\]/a WebUI\\AuthSubnetWhitelistEnabled=true' "$conf"
+		fi
+		if grep -q '^WebUI\\AuthSubnetWhitelist=' "$conf"; then
+			sed -i 's|^WebUI\\AuthSubnetWhitelist=.*|WebUI\\AuthSubnetWhitelist=127.0.0.1/32, ::1/128|' "$conf"
+		else
+			sed -i '/^WebUI\\AuthSubnetWhitelistEnabled=/a WebUI\\AuthSubnetWhitelist=127.0.0.1/32, ::1/128' "$conf"
+		fi
+	else
+		printf '\n[Preferences]\nWebUI\\AuthSubnetWhitelistEnabled=true\nWebUI\\AuthSubnetWhitelist=127.0.0.1/32, ::1/128\n' >>"$conf"
+	fi
+
+	qb_start >/dev/null 2>&1
+
+	i=0
+	while [ "$i" -lt 30 ]; do
+		port_listening "$port" && break
+		sleep 1
+		i=$((i + 1))
+	done
+	port_listening "$port" || {
+		echo "!! 等不到 $port 端口，密码没改" >&2
+		return 1
+	}
+
+	curl -s --max-time 10 -o /dev/null -w '' \
+		--data-urlencode "json={\"web_ui_password\":\"$pass\"}" \
+		"http://127.0.0.1:$port/api/v2/app/setPreferences" || {
+		echo "!! 调 qB API 失败" >&2
+		return 1
+	}
+
+	echo "== 已设置 WebUI 密码（用户名 admin）"
+	return 0
+}
+
+# 设置 OpenList 管理员密码。二进制自己写库，不用重启。
+ol_set_password() {
+	local pass v bin dir
+
+	pass="$1"
+	[ "$pass" = "-" ] && pass="$HUB_PASS"
+
+	[ -n "$pass" ] || {
+		echo "!! 密码不能为空" >&2
+		return 1
+	}
+	v=$(ol_variant)
+
+	case "$v" in
+	docker)
+		ct_running "$OL_CT" || {
+			echo "!! 容器没在跑，先把 OpenList 启动起来" >&2
+			return 1
+		}
+		docker exec "$OL_CT" ./openlist admin set "$pass"
+		;;
+	*)
+		dir=$(ol_datadir)
+		bin=/usr/bin/openlist2
+		[ -x "$bin" ] || bin=/usr/bin/openlist
+		[ -x "$bin" ] || {
+			echo "!! 找不到 openlist 二进制，先安装" >&2
+			return 1
+		}
+		"$bin" --data "$dir" admin set "$pass"
+		;;
+	esac
+}
+
 qb_start() {
 	local v
 	v=$(qb_variant)
+
+	# 用户可能绕过页面手动 apk 装过，这里补一次链接，保证读的是 datadir
+	link_datadir qbittorrent /etc/qBittorrent >/dev/null 2>&1
+	# 端口以 hub 里配的为准，写进包自己的 UCI 和 conf
+	qb_sync_port
+
 	case "$v" in
 	docker | docker-ee)
 		[ -f "$(qb_compose)" ] || qb_compose_write || return 1
@@ -425,6 +675,7 @@ qb_status() {
 	echo "qb_datadir=$(qb_datadir)"
 	echo "qb_config=$(qb_datadir)/config"
 	echo "qb_downloads=$(qb_downloads)"
+	if [ -L /etc/qBittorrent ]; then echo "qb_datalink=1"; else echo "qb_datalink=0"; fi
 	echo "qb_conflict=$( [ -n "$kind" ] && [ -n "$cstate" ] && echo 1 || echo 0 )"
 }
 
@@ -484,7 +735,9 @@ ol_compose_write() {
 			echo "    network_mode: host"
 		else
 			echo "    ports:"
-			echo "      - '$port:$port/tcp'"
+			# 容器内固定监听 5244（官方镜像的默认值，端口写在它自己的配置里），
+			# 宿主机端口用 hub 里配的那个。host 网络下不映射，所以只能是 5244。
+			echo "      - '$port:5244/tcp'"
 		fi
 		echo "    environment:"
 		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
@@ -608,10 +861,23 @@ ol_worker_install() {
 	v=$(ol_variant)
 	set_phase "installing:$v"
 
+	# openlist2 与 feeds 版的原生路径不同，两个都链到同一个 datadir，
+	# 这样三种运行方式（两个原生 + 容器）读写的是同一份 data.db。
+	ol_stop_all
+	link_datadir openlist /etc/openlist2 || {
+		set_phase "error:统一数据目录失败（/etc/openlist2）"
+		return 1
+	}
+	link_datadir openlist /etc/openlist || {
+		set_phase "error:统一数据目录失败（/etc/openlist）"
+		return 1
+	}
+
 	case "$v" in
 	feeds)
 		echo "== feeds 版（官方 openlist）"
 		ol_stop_all
+		unlink_datadir /etc/openlist
 		pkg_installed openlist2 && pkg_del openlist2
 		pkg_add openlist || {
 			set_phase "error:安装 openlist 失败"
@@ -621,6 +887,7 @@ ol_worker_install() {
 	openlist2)
 		echo "== openlist2（sbwml 预编译包）"
 		ol_stop_all
+		unlink_datadir /etc/openlist2
 		pkg_installed openlist && pkg_del openlist
 		ol2_fetch || {
 			set_phase "error:安装 openlist2 失败（下载或本地安装出错）"
@@ -649,6 +916,10 @@ ol_worker_install() {
 		;;
 	esac
 
+	# 装完再链一次：openlist2 / openlist 的包都会在 /etc 下建目录并写初始库
+	link_datadir openlist /etc/openlist2 >/dev/null 2>&1
+	link_datadir openlist /etc/openlist >/dev/null 2>&1
+
 	save_cfg openlist "variant=$v"
 	set_phase "done"
 	echo "== 完成"
@@ -657,6 +928,11 @@ ol_worker_install() {
 ol_start() {
 	local v k
 	v=$(ol_variant)
+
+	link_datadir openlist /etc/openlist2 >/dev/null 2>&1
+	link_datadir openlist /etc/openlist >/dev/null 2>&1
+	ol_sync_port
+
 	case "$v" in
 	docker)
 		[ -f "$(ol_compose)" ] || ol_compose_write || return 1
@@ -696,6 +972,7 @@ ol_status() {
 	echo "ol_port_busy=$listen"
 	echo "ol_network=$(ol_net)"
 	echo "ol_datadir=$(ol_datadir)"
+	if [ -L /etc/openlist2 ] || [ -L /etc/openlist ]; then echo "ol_datalink=1"; else echo "ol_datalink=0"; fi
 	echo "ol_conflict=$( [ -n "$kind" ] && [ -n "$cstate" ] && echo 1 || echo 0 )"
 }
 
@@ -832,6 +1109,17 @@ install) shift; cmd_install "$@" ;;
 start | stop | restart) cmd_lifecycle "$2" "$1" ;;
 remove) shift; cmd_remove "$@" ;;
 logs) shift; cmd_logs "$@" ;;
+passwd)
+	shift
+	case "$1" in
+	qbittorrent) shift; qb_set_password "$@" ;;
+	openlist) shift; ol_set_password "$@" ;;
+	*)
+		echo "用法：hub-ctl passwd qbittorrent|openlist <新密码>" >&2
+		exit 1
+		;;
+	esac
+	;;
 task) cmd_task ;;
 *)
 	cat >&2 <<EOF
@@ -842,6 +1130,7 @@ task) cmd_task ;;
   start|stop|restart <svc>        启停
   remove <svc>                    卸载（保留数据目录）
   logs <svc> [行数]               日志
+  passwd <svc> <新密码>           设置 WebUI / 管理员密码
   task                            任务阶段与日志路径
 EOF
 	exit 1

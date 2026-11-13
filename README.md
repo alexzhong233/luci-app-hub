@@ -35,16 +35,6 @@ SIGTERM 时又会把内存里的配置写回文件——两者次序不固定，
 qBittorrent 的 `config` 子目录里是 `qBittorrent.conf` 和 `BT_backup`，后者装着种子
 和做种记录，**切换运行方式或重装都不要删这个目录**。
 
-## 端口
-
-| 服务 | 默认 | 说明 |
-|---|---|---|
-| qBittorrent WebUI | 8090 | 避开 8080，Nikki/mihomo 默认占那个端口 |
-| qBittorrent BT | 21142 | 需要防火墙放行 TCP + UDP |
-| OpenList | 5244 | |
-| 1Panel | 10086 | 沿用原有配置 |
-| WorkBuddy2API | 8788 | 沿用原有配置 |
-
 ## 安装
 
 不重刷固件：
@@ -73,6 +63,86 @@ curl -fsSL https://cdn.jsdelivr.net/gh/alexzhong233/luci-app-hub@main/deploy.sh 
 /usr/libexec/hub-ctl remove openlist           # 卸载，数据目录保留
 ```
 
+## 数据保留
+
+三个问题分开答。
+
+### 升级固件（sysupgrade 勾「保留配置」）
+
+数据默认放 `/mnt/sda1/Configs/services/<服务>`，**sysupgrade 根本不碰 `/mnt`**，
+所以升级不影响。`/etc/config/hub`（端口、运行方式、数据目录这些设置）在
+base-files 默认保留的 `/etc/config/` 里，也留得住。
+
+包还带了一份 `/lib/upgrade/keep.d/luci-app-hub`，列了 `/etc/qBittorrent`、
+`/etc/openlist2`、`/etc/openlist`。这是兜底的：`/mnt/sda1` 没挂上时 ctl 会退回
+`/etc`，那时数据在 overlay 上，不列出来就会随刷机消失。
+
+### 切换运行方式（原生 ↔ 容器）
+
+**数据是共用的。** 做法是把原生目录变成指向 datadir 的符号链接：
+
+```
+/etc/qBittorrent  ->  /mnt/sda1/Configs/services/qbittorrent
+/etc/openlist2    ->  /mnt/sda1/Configs/services/openlist
+/etc/openlist     ->  /mnt/sda1/Configs/services/openlist
+```
+
+目录层级天然对齐，不需要搬文件：
+
+| 运行方式 | qB 读到的 | OpenList 读到的 |
+|---|---|---|
+| 原生 | `<dir>/config/qBittorrent.conf` | `<dir>/data.db` |
+| 容器 | `/config/qBittorrent.conf`（挂 `<dir>/config`） | `/opt/openlist/data/data.db`（挂 `<dir>`） |
+
+所以原生官方版 ↔ 原生 EE ↔ 容器官方版 ↔ 容器增强版任意互切，配置、种子、
+`.fastresume` 做种记录、存储挂载、账号密码全都在。
+
+第一次启用时会自动迁移：如果 `/etc/qBittorrent` 已经是装满数据的真实目录，
+内容会并进 datadir，**datadir 里已有的同名文件不覆盖**（用户数据优先），
+然后把目录换成链接。装包前会先摘掉链接，避免 apk 解包时把初始 `data.db`
+写穿到真实库上。
+
+### 卸载
+
+`remove` 只删包和容器，不动 datadir。页面上会显示数据目录的实际路径。
+
+## 端口与密码
+
+默认端口：
+
+| 服务 | 默认 | 说明 |
+|---|---|---|
+| qBittorrent WebUI | 8090 | 避开 8080，Nikki/mihomo 默认占那个端口 |
+| qBittorrent BT | 21142 | 需要防火墙放行 TCP + UDP |
+| OpenList | 5244 | |
+| 1Panel | 10086 | 沿用原有配置 |
+| WorkBuddy2API | 8788 | 沿用原有配置 |
+
+怎么改：
+
+| 项目 | 怎么设 | 什么时候生效 |
+|---|---|---|
+| qB WebUI 端口 | 页面填，改完自动重启 | 立即 |
+| qB BT 端口 | 同上 | 立即 |
+| qB WebUI 密码 | 页面填新密码点「设置」 | 立即 |
+| OpenList 端口 | 页面填，改完自动重启 | 原生版立即；容器 host 网络固定 5244 |
+| OpenList 管理员密码 | 页面填新密码点「设置」 | 立即 |
+
+端口会同步写进各包自己的配置（`qbittorrent.config.http_port`、
+`qBittorrent.conf` 的 `WebUI\Port` / `Session\Port`、`openlist2.config.port`、
+`openlist.config.listen_http_port`）—— hub 的 UCI 只是入口，不同步的话
+包的 init 读不到，改了也不生效。
+
+**qB 密码不用 PBKDF2 硬算**：那个格式要 100000 轮 PBKDF2-HMAC-SHA512，shell
+里生成不了。做法是先把 `127.0.0.1` 加进免密白名单，从路由器本机调 qB 自己的
+`/api/v2/app/setPreferences`，qB 自己算 hash。副作用是**本机免密**——忘了密码
+时从路由器上还能进去改，LAN 访问照旧要密码。
+
+**OpenList 密码**走二进制自带的命令：`openlist2 --data <dir> admin set <密码>`
+（容器版是 `docker exec openlist ./openlist admin set`），直接写库，不用重启。
+
+密码通过 `fs.exec` 的环境参数传（`HUB_PASS`），argv 里只有 `-`，`ps` 看不到明文。
+
 ## openlist2 是怎么装的
 
 固件不带 openlist2，它的源码仓库里也没有现成二进制（`Makefile` 是编译期从
@@ -96,5 +166,6 @@ https://github.com/sbwml/luci-app-openlist2/releases/latest/download/openwrt-<sd
 ## 已知问题
 
 - **原生版和容器版共用同一个端口**，同一时刻只能跑一个。切换时先「卸载」再选另一种「安装」；直接点安装会把对方停掉，但两个实现同时存在时状态栏会标 `conflict=1`。
-- **OpenList 从原生切容器**时，`data.db` 会被原地接管（同一个目录）。切换前先停服务，避免 SQLite 的 WAL 处于写入状态。
-- **qBittorrent 的 `WebUI_PORT` 只在容器首次启动时生效**，之后改端口要改 `config/qBittorrent.conf` 里的 `WebUI\Port`，环境变量不再起作用。
+- **qBittorrent 容器版的 `WEBUI_PORT` 只在首次启动时生效**，之后端口以 `config/qBittorrent.conf` 为准。hub 在启动前会把 hub 里配的端口写进这个文件，所以页面上改端口仍然有效。
+- **OpenList 容器版在 host 网络下固定监听 5244**（端口写在容器自己的配置里）。要换宿主机端口得切 bridge，compose 会映射 `宿主机端口:5244`。
+- **原生版和容器版共用同一个端口**，切换时 ctl 会自动停掉另一边，不用先手动卸载。
