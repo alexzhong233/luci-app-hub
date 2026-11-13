@@ -1,0 +1,21 @@
+{
+	"luci-app-hub": {
+		"description": "服务合集：安装/启停 1Panel、WorkBuddy2API、qBittorrent、OpenList，并切换各自的运行方式",
+		"read": {
+			"file": {
+				"/usr/libexec/hub-ctl": [ "exec" ],
+				"/usr/libexec/1panel-ctl": [ "exec" ],
+				"/usr/libexec/workbuddy2api-ctl": [ "exec" ]
+			},
+			"uci": [ "hub", "1panel", "workbuddy2api" ]
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/hub-ctl": [ "exec" ],
+				"/usr/libexec/1panel-ctl": [ "exec" ],
+				"/usr/libexec/workbuddy2api-ctl": [ "exec" ]
+			},
+			"uci": [ "hub", "1panel", "workbuddy2api" ]
+		}
+	}
+}

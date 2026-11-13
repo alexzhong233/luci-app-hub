@@ -1,0 +1,13 @@
+{
+	"admin/services/hub": {
+		"title": "服务合集",
+		"order": 61,
+		"action": {
+			"type": "view",
+			"path": "hub/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-hub" ]
+		}
+	}
+}

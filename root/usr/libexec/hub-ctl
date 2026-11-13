@@ -1,0 +1,757 @@
+#!/bin/sh
+# luci-app-hub 的后端：qBittorrent（4 种运行方式）与 OpenList（3 种）。
+#
+# 1Panel 和 WorkBuddy2API 的 ctl 原样放进同一个包，本脚本不重写它们的逻辑，
+# 页面直接调各自的 ctl —— 这两个已经跑稳了，为了"合并"再动一遍没有收益。
+#
+# qBittorrent
+#   luci       原生官方包 qbittorrent（feeds）
+#   luci-ee    原生增强版 qbittorrent-enhanced-edition（同二进制名、同一份 init）
+#   docker     容器官方版 lscr.io/linuxserver/qbittorrent
+#   docker-ee  容器增强版 p3terx/qbittorrent-enhanced
+#
+# OpenList
+#   feeds      官方 openlist 包，数据 /etc/openlist
+#   openlist2  sbwml/luci-app-openlist2，数据 /etc/openlist2
+#   docker     容器版 openlistteam/openlist
+#
+# 数据目录优先级（按用户要求：优先 sda1，其次与 luci 版同位置）
+#   1. hub.<name>.datadir 显式指定
+#   2. /mnt/sda1 存在可写 → /mnt/sda1/Configs/services/<name>
+#   3. 该服务原生版的数据目录（/etc/qBittorrent、/etc/openlist2 …）
+
+SELF=$(readlink -f "$0" 2>/dev/null || echo /usr/libexec/hub-ctl)
+TASK_DIR="/var/run/hub-task"
+
+QBT_IMG_STD="lscr.io/linuxserver/qbittorrent:latest"
+QBT_IMG_EE="p3terx/qbittorrent-enhanced:latest"
+OL_IMG="openlistteam/openlist:latest"
+
+QBT_CT="qbittorrent"
+OL_CT="openlist"
+
+DATA_ROOT_DEFAULT="/mnt/sda1/Configs/services"
+
+# ---------------------------------------------------------------- 配置存取
+cfg() {
+	uci -q get "hub.$1" 2>/dev/null
+}
+
+cfg_def() {
+	local v
+	v=$(cfg "$1")
+	[ -n "$v" ] && echo "$v" || echo "$2"
+}
+
+# save_cfg <section-key> [k=v ...]，section-key 就是段名，如 qbittorrent
+save_cfg() {
+	local sec="$1" kv
+	shift
+
+	uci -q get "hub.$sec" >/dev/null 2>&1 || {
+		case "$sec" in
+		global) uci -q set "hub.$sec=hub" ;;
+		*) uci -q set "hub.$sec=service" ;;
+		esac
+	}
+	for kv in "$@"; do
+		uci -q set "hub.$sec.${kv%%=*}=${kv#*=}"
+	done
+	uci -q commit hub
+}
+
+# ---------------------------------------------------------------- 基础工具
+arch_name() {
+	case "$(uname -m)" in
+	aarch64) echo "aarch64" ;;
+	x86_64) echo "x86_64" ;;
+	armv7*) echo "armv7" ;;
+	*) uname -m ;;
+	esac
+}
+
+lan_ip() {
+	local dev
+	dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+	[ -n "$dev" ] || return 0
+	ip -4 addr show "$dev" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+}
+
+have_docker() { command -v docker >/dev/null 2>&1; }
+
+docker_live() {
+	have_docker || return 1
+	docker info >/dev/null 2>&1
+}
+
+# /proc/net/tcp 的本地地址形如 0100007F:1F90，端口是冒号后的 4 位十六进制。
+# 不依赖 ss/netstat —— OpenWrt 上 ss 不一定存在，前面排查端口时就吃过这个亏。
+port_listening() {
+	local p="$1" hex
+	[ -n "$p" ] || return 1
+	hex=$(printf '%04X' "$p" 2>/dev/null) || return 1
+	awk -v h=":$hex" 'NR>1 && substr($2, length($2)-4) == h {f=1} END{exit !f}' \
+		/proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+ct_state() {
+	docker_live || return 1
+	docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null
+}
+
+ct_present() { [ -n "$(ct_state "$1")" ]; }
+
+ct_running() { [ "$(ct_state "$1")" = "running" ]; }
+
+compose_bin() {
+	if docker_live && docker compose version >/dev/null 2>&1; then
+		echo "docker compose"
+		return 0
+	fi
+	command -v docker-compose >/dev/null 2>&1 && {
+		echo "docker-compose"
+		return 0
+	}
+	return 1
+}
+
+# compose <project> <file> <args...>
+compose() {
+	local proj="$1" file="$2" bin
+	shift 2
+	bin=$(compose_bin) || return 1
+	# shellcheck disable=SC2086
+	$bin -p "$proj" -f "$file" "$@"
+}
+
+yaml_q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
+
+# ---------------------------------------------------------------- 包管理
+pkg_mgr() {
+	if command -v apk >/dev/null 2>&1; then
+		echo apk
+	elif command -v opkg >/dev/null 2>&1; then
+		echo opkg
+	fi
+}
+
+pkg_installed() {
+	case "$(pkg_mgr)" in
+	apk) apk info -e "$1" >/dev/null 2>&1 ;;
+	opkg) opkg list-installed 2>/dev/null | grep -q "^$1 " ;;
+	*) return 1 ;;
+	esac
+}
+
+pkg_add() {
+	case "$(pkg_mgr)" in
+	apk) apk update >/dev/null 2>&1; apk add "$@" ;;
+	opkg) opkg update >/dev/null 2>&1; opkg install "$@" ;;
+	*) return 1 ;;
+	esac
+}
+
+pkg_del() {
+	case "$(pkg_mgr)" in
+	# 切换官方版/增强版时，另一端往往还被 luci-app-* 依赖着，直接删会被拒。
+	# 先按常规删，不行再放宽依赖检查 —— 反正紧接着就要装另一个。
+	apk)
+		apk del "$@" >/dev/null 2>&1 || apk del --force-broken-world "$@" 2>/dev/null
+		;;
+	opkg)
+		opkg remove "$@" >/dev/null 2>&1 || opkg remove --force-depends "$@" 2>/dev/null
+		;;
+	*) return 1 ;;
+	esac
+}
+
+# ---------------------------------------------------------------- 任务
+task_phase() {
+	[ -s "$TASK_DIR/state" ] && cat "$TASK_DIR/state" 2>/dev/null || echo "idle"
+}
+
+set_phase() {
+	mkdir -p "$TASK_DIR"
+	echo "$1" >"$TASK_DIR/state"
+}
+
+spawn_task() {
+	local phase="$1" label="$2" log="$TASK_DIR/log"
+	shift 2
+
+	mkdir -p "$TASK_DIR"
+	: >"$log"
+	set_phase "$phase"
+
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$SELF" "$@" </dev/null >>"$log" 2>&1 &
+	else
+		("$SELF" "$@" </dev/null >>"$log" 2>&1 &)
+	fi
+
+	echo "已开始：$label"
+	echo "任务在后台执行，完成后刷新本页；日志：$log"
+}
+
+# ---------------------------------------------------------------- 数据目录
+is_mnt_ok() {
+	[ -d /mnt/sda1 ] && [ -w /mnt/sda1 ] && mountpoint -q /mnt/sda1 2>/dev/null
+}
+
+data_root() {
+	local d
+	d=$(cfg global.datadir)
+	if [ -n "$d" ]; then
+		echo "$d"
+	elif is_mnt_ok; then
+		echo "$DATA_ROOT_DEFAULT"
+	else
+		echo "/etc/services"
+	fi
+}
+
+# 各服务原生版的数据目录，容器版选"跟随 luci"时也用它。
+native_datadir() {
+	case "$1" in
+	qbittorrent) echo "/etc/qBittorrent" ;;
+	openlist)
+		case "$(ol_variant)" in
+		feeds) echo "/etc/openlist" ;;
+		*) echo "/etc/openlist2" ;;
+		esac
+		;;
+	esac
+}
+
+# svc_datadir <svc> —— 显式 > sda1 > 原生位置
+svc_datadir() {
+	local svc="$1" explicit
+	explicit=$(cfg "$1.datadir")
+	if [ -n "$explicit" ]; then
+		echo "$explicit"
+	elif is_mnt_ok; then
+		echo "$(data_root)/$svc"
+	else
+		native_datadir "$svc"
+	fi
+}
+
+# ================================================================ qBittorrent
+qb_variant() { cfg_def qbittorrent.variant luci; }
+qb_port() { cfg_def qbittorrent.port 8090; }
+qb_bt_port() { cfg_def qbittorrent.bt_port 21142; }
+qb_net() { cfg_def qbittorrent.network host; }
+qb_downloads() { cfg_def qbittorrent.downloads "/mnt/sda1/movie"; }
+qb_datadir() { svc_datadir qbittorrent; }
+qb_compose() { echo "$(qb_datadir)/docker-compose.yml"; }
+qb_image() {
+	case "$(qb_variant)" in
+	docker-ee) cfg_def qbittorrent.image "$QBT_IMG_EE" ;;
+	*) cfg_def qbittorrent.image "$QBT_IMG_STD" ;;
+	esac
+}
+
+# 原生版装的是哪一个：std / ee / 空
+qb_native_kind() {
+	if pkg_installed qbittorrent-enhanced-edition; then
+		echo ee
+	elif pkg_installed qbittorrent; then
+		echo std
+	elif [ -x /usr/bin/qbittorrent-nox ]; then
+		echo std
+	fi
+}
+
+qb_native_running() {
+	[ -x /etc/init.d/qbittorrent ] || return 1
+	/etc/init.d/qbittorrent status >/dev/null 2>&1
+}
+
+qb_compose_write() {
+	local f port bt net dir cfgdir dl img
+
+	f=$(qb_compose)
+	port=$(qb_port)
+	bt=$(qb_bt_port)
+	net=$(qb_net)
+	dir=$(qb_datadir)
+	img=$(qb_image)
+	dl=$(qb_downloads)
+
+	# 配置目录跟着数据目录走：/config 里是 qBittorrent.conf 与 BT_backup，
+	# 丢了等于把种子和做种记录全丢，必须落在可保留的位置。
+	cfgdir="$dir/config"
+
+	mkdir -p "$cfgdir" "$dl" || return 1
+
+	{
+		echo "# 由 luci-app-hub 生成，修改会被覆盖。"
+		echo "services:"
+		echo "  $QBT_CT:"
+		echo "    image: $(yaml_q "$img")"
+		echo "    container_name: $QBT_CT"
+		echo "    hostname: qbittorrent"
+		echo "    restart: unless-stopped"
+		if [ "$net" = "host" ]; then
+			echo "    network_mode: host"
+		else
+			echo "    ports:"
+			echo "      - '$port:$port/tcp'"
+			echo "      - '$bt:$bt/tcp'"
+			echo "      - '$bt:$bt/udp'"
+		fi
+		echo "    environment:"
+		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
+		echo "      PUID: '0'"
+		echo "      PGID: '0'"
+		echo "      UMASK: '022'"
+		echo "      WEBUI_PORT: $(yaml_q "$port")"
+		echo "      TORRENTING_PORT: $(yaml_q "$bt")"
+		echo "    volumes:"
+		echo "      - $(yaml_q "$cfgdir:/config")"
+		echo "      - $(yaml_q "$dl:/downloads")"
+		# 不挂 /etc/localtime：OpenWrt 上它是符号链接，目标常常不存在，
+		# Docker 建挂载源时 mkdir 已存在的路径会直接 EEXIST。TZ 已经给了。
+	} >"$f" || return 1
+
+	chmod 600 "$f"
+	return 0
+}
+
+qb_stop_all() {
+	[ -x /etc/init.d/qbittorrent ] && /etc/init.d/qbittorrent stop >/dev/null 2>&1
+	ct_running "$QBT_CT" && docker stop "$QBT_CT" >/dev/null 2>&1
+	# qB 收到 SIGTERM 会把内存配置写回 conf，等它退干净再动文件
+	sleep 1
+	killall -9 qbittorrent-nox >/dev/null 2>&1
+	return 0
+}
+
+qb_worker_install() {
+	local v
+	v=$(qb_variant)
+	set_phase "installing:$v"
+
+	case "$v" in
+	luci)
+		echo "== 原生官方版"
+		qb_stop_all
+		pkg_installed qbittorrent-enhanced-edition && pkg_del qbittorrent-enhanced-edition
+		pkg_add qbittorrent || {
+			set_phase "error:安装 qbittorrent 失败"
+			return 1
+		}
+		;;
+	luci-ee)
+		echo "== 原生增强版"
+		qb_stop_all
+		pkg_installed qbittorrent && pkg_del qbittorrent
+		pkg_add qbittorrent-enhanced-edition || {
+			set_phase "error:安装 qbittorrent-enhanced-edition 失败"
+			return 1
+		}
+		;;
+	docker | docker-ee)
+		echo "== 容器版 $v"
+		if [ -n "$(qb_native_kind)" ]; then
+			echo "-- 检测到原生版，先停掉（共用同一端口）"
+			qb_stop_all
+		fi
+		qb_compose_write || {
+			set_phase "error:写 compose 失败"
+			return 1
+		}
+		compose "$QBT_CT" "$(qb_compose)" pull || echo "== pull 有告警，继续"
+		compose "$QBT_CT" "$(qb_compose)" up -d || {
+			set_phase "error:compose up 失败"
+			return 1
+		}
+		;;
+	*)
+		set_phase "error:未知变体 $v"
+		return 1
+		;;
+	esac
+
+	# 把变体写进 uci，下次打开页面能对上
+	save_cfg qbittorrent "variant=$v"
+	set_phase "done"
+	echo "== 完成"
+}
+
+qb_start() {
+	local v
+	v=$(qb_variant)
+	case "$v" in
+	docker | docker-ee)
+		[ -f "$(qb_compose)" ] || qb_compose_write || return 1
+		compose "$QBT_CT" "$(qb_compose)" up -d
+		;;
+	*)
+		[ -x /etc/init.d/qbittorrent ] || return 1
+		/etc/init.d/qbittorrent start
+		;;
+	esac
+}
+
+qb_stop() {
+	qb_stop_all
+}
+
+qb_status() {
+	local v kind img cstate running listen
+	v=$(qb_variant)
+	kind=$(qb_native_kind)
+	img=$(qb_image)
+	cstate=$(ct_state "$QBT_CT" 2>/dev/null)
+	running=0
+	listen=0
+	port_listening "$(qb_port)" && listen=1
+
+	case "$v" in
+	docker | docker-ee) [ "$cstate" = "running" ] && running=1 ;;
+	*) qb_native_running && running=1 ;;
+	esac
+
+	echo "qb_variant=$v"
+	echo "qb_native=$kind"
+	echo "qb_image=$img"
+	echo "qb_ct=$cstate"
+	echo "qb_running=$running"
+	echo "qb_port=$(qb_port)"
+	echo "qb_port_busy=$listen"
+	echo "qb_bt_port=$(qb_bt_port)"
+	echo "qb_network=$(qb_net)"
+	echo "qb_datadir=$(qb_datadir)"
+	echo "qb_config=$(qb_datadir)/config"
+	echo "qb_downloads=$(qb_downloads)"
+	echo "qb_conflict=$( [ -n "$kind" ] && [ -n "$cstate" ] && echo 1 || echo 0 )"
+}
+
+# ================================================================ OpenList
+ol_variant() { cfg_def openlist.variant openlist2; }
+ol_port() { cfg_def openlist.port 5244; }
+ol_net() { cfg_def openlist.network host; }
+ol_datadir() {
+	local explicit
+	explicit=$(cfg openlist.datadir)
+	if [ -n "$explicit" ]; then
+		echo "$explicit"
+	elif is_mnt_ok; then
+		echo "$(data_root)/openlist"
+	else
+		native_datadir openlist
+	fi
+}
+ol_compose() { echo "$(ol_datadir)/docker-compose.yml"; }
+ol_image() { cfg_def openlist.image "$OL_IMG"; }
+
+# 原生版装了哪一个：feeds(openlist) / openlist2 / 空
+ol_native_kind() {
+	if pkg_installed openlist2 || [ -x /etc/init.d/openlist2 ]; then
+		echo openlist2
+	elif pkg_installed openlist || [ -x /etc/init.d/openlist ]; then
+		echo feeds
+	fi
+}
+
+ol_native_running() {
+	local k
+	k=$(ol_native_kind)
+	[ -n "$k" ] || return 1
+	[ -x "/etc/init.d/$k" ] && "/etc/init.d/$k" status >/dev/null 2>&1
+}
+
+ol_compose_write() {
+	local f port net dir img
+
+	f=$(ol_compose)
+	port=$(ol_port)
+	net=$(ol_net)
+	dir=$(ol_datadir)
+	img=$(ol_image)
+
+	mkdir -p "$dir" || return 1
+
+	{
+		echo "# 由 luci-app-hub 生成，修改会被覆盖。"
+		echo "services:"
+		echo "  $OL_CT:"
+		echo "    image: $(yaml_q "$img")"
+		echo "    container_name: $OL_CT"
+		echo "    restart: unless-stopped"
+		if [ "$net" = "host" ]; then
+			echo "    network_mode: host"
+		else
+			echo "    ports:"
+			echo "      - '$port:$port/tcp'"
+		fi
+		echo "    environment:"
+		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
+		echo "      PUID: '0'"
+		echo "      PGID: '0'"
+		echo "      UMASK: '022'"
+		echo "    volumes:"
+		# 官方镜像的数据目录是 /opt/openlist/data，config.json 与 data.db 都在里面
+		echo "      - $(yaml_q "$dir:/opt/openlist/data")"
+		# 网盘挂载的本地目录：整机 /mnt 只读挂进去，面板里选存储路径时能看到
+		echo "      - $(yaml_q "/mnt:/mnt:rslave")"
+	} >"$f" || return 1
+
+	chmod 600 "$f"
+	return 0
+}
+
+ol_stop_all() {
+	local k
+	k=$(ol_native_kind)
+	[ -n "$k" ] && [ -x "/etc/init.d/$k" ] && "/etc/init.d/$k" stop >/dev/null 2>&1
+	ct_running "$OL_CT" && docker stop "$OL_CT" >/dev/null 2>&1
+	sleep 1
+	return 0
+}
+
+ol_worker_install() {
+	local v
+	v=$(ol_variant)
+	set_phase "installing:$v"
+
+	case "$v" in
+	feeds)
+		echo "== feeds 版（官方 openlist）"
+		ol_stop_all
+		pkg_installed openlist2 && pkg_del openlist2
+		pkg_add openlist || {
+			set_phase "error:安装 openlist 失败"
+			return 1
+		}
+		;;
+	openlist2)
+		echo "== openlist2（sbwml）"
+		ol_stop_all
+		pkg_installed openlist && pkg_del openlist
+		pkg_add luci-app-openlist2 || {
+			set_phase "error:安装 luci-app-openlist2 失败"
+			return 1
+		}
+		;;
+	docker)
+		echo "== 容器版"
+		if [ -n "$(ol_native_kind)" ]; then
+			echo "-- 检测到原生版，先停掉（共用同一端口）"
+			ol_stop_all
+		fi
+		ol_compose_write || {
+			set_phase "error:写 compose 失败"
+			return 1
+		}
+		compose "$OL_CT" "$(ol_compose)" pull || echo "== pull 有告警，继续"
+		compose "$OL_CT" "$(ol_compose)" up -d || {
+			set_phase "error:compose up 失败"
+			return 1
+		}
+		;;
+	*)
+		set_phase "error:未知变体 $v"
+		return 1
+		;;
+	esac
+
+	save_cfg openlist "variant=$v"
+	set_phase "done"
+	echo "== 完成"
+}
+
+ol_start() {
+	local v k
+	v=$(ol_variant)
+	case "$v" in
+	docker)
+		[ -f "$(ol_compose)" ] || ol_compose_write || return 1
+		compose "$OL_CT" "$(ol_compose)" up -d
+		;;
+	*)
+		k=$(ol_native_kind)
+		[ -n "$k" ] || k="$v"
+		[ -x "/etc/init.d/$k" ] || return 1
+		"/etc/init.d/$k" start
+		;;
+	esac
+}
+
+ol_stop() { ol_stop_all; }
+
+ol_status() {
+	local v kind cstate running listen
+	v=$(ol_variant)
+	kind=$(ol_native_kind)
+	cstate=$(ct_state "$OL_CT" 2>/dev/null)
+	running=0
+	listen=0
+	port_listening "$(ol_port)" && listen=1
+
+	case "$v" in
+	docker) [ "$cstate" = "running" ] && running=1 ;;
+	*) ol_native_running && running=1 ;;
+	esac
+
+	echo "ol_variant=$v"
+	echo "ol_native=$kind"
+	echo "ol_image=$(ol_image)"
+	echo "ol_ct=$cstate"
+	echo "ol_running=$running"
+	echo "ol_port=$(ol_port)"
+	echo "ol_port_busy=$listen"
+	echo "ol_network=$(ol_net)"
+	echo "ol_datadir=$(ol_datadir)"
+	echo "ol_conflict=$( [ -n "$kind" ] && [ -n "$cstate" ] && echo 1 || echo 0 )"
+}
+
+# ================================================================ 命令分发
+cmd_status() {
+	echo "task=$(task_phase)"
+	echo "arch=$(arch_name)"
+	echo "docker=$(docker_live && echo 1 || echo 0)"
+	echo "mnt=$(is_mnt_ok && echo 1 || echo 0)"
+	echo "dataroot=$(data_root)"
+	echo "lanip=$(lan_ip)"
+	qb_status
+	ol_status
+}
+
+cmd_install() {
+	local svc="$1"
+	case "$svc" in
+	qbittorrent) spawn_task "installing:$(qb_variant)" "安装 qBittorrent" _worker_qb_install ;;
+	openlist) spawn_task "installing:$(ol_variant)" "安装 OpenList" _worker_ol_install ;;
+	*)
+		echo "用法：hub-ctl install qbittorrent|openlist" >&2
+		return 1
+		;;
+	esac
+}
+
+cmd_lifecycle() {
+	local svc="$1" act="$2"
+	case "$svc:$act" in
+	qbittorrent:start) qb_start ;;
+	qbittorrent:stop) qb_stop ;;
+	qbittorrent:restart)
+		qb_stop
+		sleep 1
+		qb_start
+		;;
+	openlist:start) ol_start ;;
+	openlist:stop) ol_stop ;;
+	openlist:restart)
+		ol_stop
+		sleep 1
+		ol_start
+		;;
+	*)
+		echo "用法：hub-ctl <start|stop|restart> qbittorrent|openlist" >&2
+		return 1
+		;;
+	esac
+}
+
+cmd_remove() {
+	local svc="$1" kind
+	case "$svc" in
+	qbittorrent)
+		qb_stop_all
+		if [ -f "$(qb_compose)" ]; then
+			compose "$QBT_CT" "$(qb_compose)" down >/dev/null 2>&1
+			rm -f "$(qb_compose)"
+		fi
+		kind=$(qb_native_kind)
+		case "$kind" in
+		ee) pkg_del qbittorrent-enhanced-edition ;;
+		std) pkg_del qbittorrent ;;
+		esac
+		docker rmi "$(qb_image)" >/dev/null 2>&1
+		;;
+	openlist)
+		ol_stop_all
+		if [ -f "$(ol_compose)" ]; then
+			compose "$OL_CT" "$(ol_compose)" down >/dev/null 2>&1
+			rm -f "$(ol_compose)"
+		fi
+		kind=$(ol_native_kind)
+		case "$kind" in
+		openlist2) pkg_del luci-app-openlist2 ;;
+		feeds) pkg_del openlist ;;
+		esac
+		docker rmi "$(ol_image)" >/dev/null 2>&1
+		;;
+	*)
+		echo "用法：hub-ctl remove qbittorrent|openlist" >&2
+		return 1
+		;;
+	esac
+	echo "已卸载 $svc（数据目录保留：$(svc_datadir "$svc")）"
+}
+
+cmd_logs() {
+	local svc="$1" n="${2:-40}"
+	case "$svc" in
+	qbittorrent)
+		if ct_present "$QBT_CT"; then
+			docker logs --tail "$n" "$QBT_CT" 2>&1
+		else
+			tail -n "$n" /var/log/qbittorrent 2>/dev/null ||
+				logread 2>/dev/null | grep -i qbittorrent | tail -n "$n"
+		fi
+		;;
+	openlist)
+		if ct_present "$OL_CT"; then
+			docker logs --tail "$n" "$OL_CT" 2>&1
+		else
+			logread 2>/dev/null | grep -i openlist | tail -n "$n"
+		fi
+		;;
+	*)
+		echo "用法：hub-ctl logs qbittorrent|openlist [行数]" >&2
+		return 1
+		;;
+	esac
+}
+
+cmd_task() {
+	echo "phase=$(task_phase)"
+	echo "log=$TASK_DIR/log"
+}
+
+# 后台 worker 入口：任务系统靠 $SELF 重新调起自己，参数前缀下划线区分
+case "$1" in
+_worker_qb_install)
+	qb_worker_install
+	exit $?
+	;;
+_worker_ol_install)
+	ol_worker_install
+	exit $?
+	;;
+esac
+
+case "$1" in
+status) shift; cmd_status ;;
+install) shift; cmd_install "$@" ;;
+start | stop | restart) cmd_lifecycle "$2" "$1" ;;
+remove) shift; cmd_remove "$@" ;;
+logs) shift; cmd_logs "$@" ;;
+task) cmd_task ;;
+*)
+	cat >&2 <<EOF
+用法：hub-ctl <命令>
+
+  status                          输出所有服务的状态（key=value）
+  install <qbittorrent|openlist>  按当前 variant 安装（后台任务）
+  start|stop|restart <svc>        启停
+  remove <svc>                    卸载（保留数据目录）
+  logs <svc> [行数]               日志
+  task                            任务阶段与日志路径
+EOF
+	exit 1
+	;;
+esac

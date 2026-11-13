@@ -1,0 +1,1084 @@
+#!/bin/sh
+# 1Panel v2 在 OpenWrt 上的两套安装方式：容器版与本地版。
+#
+# 容器版：docker compose 起 moelin/1panel，面板数据挂在 /mnt 下，容器内
+#   1pctl 认的 BASE_DIR 就是宿主机路径，所以面板里装应用时挂载路径是对的。
+# 本地版：官方 install.sh 检测到 /etc/rc.common 就用 procd 托管，二进制
+#   152MB 落在 overlay，数据同样在 /mnt。
+#
+# 两套会抢同一个端口和同一份数据目录，所以互斥：真要同时装，ctl 直接拒绝，
+# 页面提示先卸载。
+#
+# 环境变量 BASE_DIR / PORT / ENTRANCE / USERNAME / PASSWORD 是 moelin/1panel
+# 镜像 entrypoint.sh 认的参数，首次初始化时写进面板数据库。本地版则由
+# install.sh 把它们写进 /usr/local/bin/1pctl，1panel-core 启动时从那里读。
+
+BASE_URL="https://resource.fit2cloud.com/1panel/package/v2/stable"
+BIN_DIR="/usr/local/bin"
+INIT_DIR="/etc/init.d"
+TASK_DIR="/var/run/1panel-task"
+
+CT_NAME="1panel"
+CT_IMAGE_DEFAULT="moelin/1panel:v2"
+DIR_DEFAULT="/mnt/sda1/Configs/1Panel"
+
+# ---------------------------------------------------------------- 配置存取
+cfg() {
+	uci -q get "1panel.$1" 2>/dev/null
+}
+
+cfg_def() {
+	local v
+	v=$(cfg "$1")
+	[ -n "$v" ] && echo "$v" || echo "$2"
+}
+
+# save_cfg <section> [key=value ...]
+save_cfg() {
+	local sec="$1" kv
+	shift
+
+	uci -q get "1panel.$sec" >/dev/null 2>&1 || uci -q set "1panel.$sec=1panel"
+	for kv in "$@"; do
+		uci -q set "1panel.$sec.${kv%%=*}=${kv#*=}"
+	done
+	uci -q commit 1panel
+}
+
+DATADIR_N=$(cfg_def main.datadir "$DIR_DEFAULT")
+PORT_N=$(cfg_def main.port 10086)
+USER_N=$(cfg_def main.username 1panel)
+ENT_N=$(cfg main.entrance)
+
+DATADIR_C=$(cfg_def container.datadir "$DIR_DEFAULT")
+PORT_C=$(cfg_def container.port 10086)
+USER_C=$(cfg_def container.username 1panel)
+ENT_C=$(cfg container.entrance)
+IMAGE_C=$(cfg_def container.image "$CT_IMAGE_DEFAULT")
+ROOTPATH_C=$(cfg_def container.rootpath 0)
+
+# 容器版的 compose 文件放数据目录：刷机不丢，删数据才跟着没。
+COMPOSE_FILE="$DATADIR_C/docker-compose.yml"
+
+RUN_DIR_N="$DATADIR_N/1panel"
+RUN_DIR_C="$DATADIR_C/1panel"
+
+# ---------------------------------------------------------------- 基础查询
+arch_name() {
+	case "$(uname -m)" in
+		aarch64 | arm64) echo "arm64" ;;
+		x86_64 | amd64) echo "amd64" ;;
+		*) echo "" ;;
+	esac
+}
+
+# 面板给的 ipaddr 常常带掩码（192.168.88.1/24），直接拼 URL 会变成
+# http://192.168.88.1/24:10086 —— 所以一律先剥掉 /xx。
+lan_ip() {
+	local ip
+
+	ip=$(uci -q get network.lan.ipaddr)
+	ip=${ip%%/*}
+
+	if [ -z "$ip" ]; then
+		ip=$(ip -4 addr show br-lan 2>/dev/null |
+			awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+	fi
+
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr)
+	echo "${ip:-192.168.1.1}"
+}
+
+need_bash() {
+	command -v bash >/dev/null 2>&1 && return 0
+	echo "缺少 bash：1Panel 的 install.sh 和 1pctl 都是 bash 脚本。" >&2
+	echo "先装：apk add bash" >&2
+	return 1
+}
+
+have_docker() {
+	command -v docker >/dev/null 2>&1
+}
+
+docker_live() {
+	have_docker && docker info >/dev/null 2>&1
+}
+
+# 只输出一行版本号。1pctl 里的命令是 `1panel version`，它把 i18n 前缀也印
+# 出来——中文下是「版本: v2.4.2」，英文是「version: v2.4.2」，后面还有一行
+# 「模式: stable」。所以不认标签，只取第一个形如 v2.4.2 的词。
+pick_version() {
+	awk '{ for (i = 1; i <= NF; i++)
+		if ($i ~ /^v?[0-9]+\.[0-9]+\.[0-9]+/) { sub(/[,;)]+$/, "", $i); print $i; exit } }'
+}
+
+# 比较版本时把前缀 v 去掉：远端给的是 v2.4.2，面板库里存的是 2.4.2。
+vnum() {
+	echo "${1#v}"
+}
+
+task_phase() {
+	[ -s "$TASK_DIR/state" ] && cat "$TASK_DIR/state" 2>/dev/null || echo "idle"
+}
+
+set_phase() {
+	mkdir -p "$TASK_DIR"
+	echo "$1" >"$TASK_DIR/state"
+}
+
+cached_remote_version() {
+	[ -s "$TASK_DIR/latest" ] && cat "$TASK_DIR/latest" 2>/dev/null
+}
+
+remote_version() {
+	local v
+
+	v=$(curl -fsSL --max-time 12 "$BASE_URL/latest" 2>/dev/null | tr -d ' \r\n')
+	case "$v" in
+		v[0-9]*) echo "$v" ;;
+		*) echo "" ;;
+	esac
+}
+
+disk_info() {
+	local d_free o_free k_free
+
+	d_free=$(df -k "$DIR_DEFAULT" 2>/dev/null | awk 'NR==2 {print $4}')
+	[ -n "$d_free" ] || d_free=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+	o_free=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+	k_free=""
+	if docker_live; then
+		local root
+		root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+		[ -n "$root" ] && k_free=$(df -k "$root" 2>/dev/null | awk 'NR==2 {print $4}')
+	fi
+
+	echo "data_free_kb=${d_free:-0}"
+	echo "overlay_free_kb=${o_free:-0}"
+	echo "docker_free_kb=${k_free:-0}"
+}
+
+# ------------------------------------------------------------------ 本地版
+native_installed() {
+	[ -x "$BIN_DIR/1pctl" ]
+}
+
+core_pid() {
+	local p exe
+
+	for p in /proc/[0-9]*; do
+		[ -r "$p/cmdline" ] || continue
+		exe=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+		case "$exe" in
+			*/1panel-core*) echo "${p#/proc/}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+native_running() {
+	core_pid >/dev/null 2>&1
+}
+
+port_listening() {
+	netstat -lnt 2>/dev/null | grep -q ":$1 "
+}
+
+# ---------------------------------------------------------------- 容器版
+# 返回 docker 的 State.Status：running / exited / created / paused；容器不存在
+# 时返回空。
+ct_state() {
+	docker_live || return 1
+	docker inspect --format '{{.State.Status}}' "$CT_NAME" 2>/dev/null
+}
+
+ct_present() {
+	[ -n "$(ct_state)" ]
+}
+
+ct_running() {
+	[ "$(ct_state)" = "running" ]
+}
+
+ct_env() {
+	docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CT_NAME" 2>/dev/null |
+		sed -n "s/^$1=//p" | head -n1
+}
+
+compose_bin() {
+	if docker_live && docker compose version >/dev/null 2>&1; then
+		echo "docker compose"
+		return 0
+	fi
+	command -v docker-compose >/dev/null 2>&1 && {
+		echo "docker-compose"
+		return 0
+	}
+	return 1
+}
+
+# 有 compose 就走 compose（用户能直接看/改那份 compose 文件），没有就退回
+# docker run，参数等价。
+compose() {
+	local bin
+	bin=$(compose_bin) || return 1
+	# shellcheck disable=SC2086
+	$bin -p "$CT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+yaml_q() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+compose_write() {
+	local f="$1" root="$2" tz mnt_opt
+
+	tz=$(uci -q get system.@system[0].zonename)
+	[ -n "$tz" ] || tz="Asia/Shanghai"
+
+	# /mnt 是挂载点时才用 rslave：面板里装的应用容器要能跟着看到 /mnt 的变化。
+	mnt_opt="/mnt:/mnt"
+	mountpoint -q /mnt 2>/dev/null && mnt_opt="/mnt:/mnt:rslave"
+
+	mkdir -p "$(dirname "$f")" || return 1
+
+	{
+		echo "# 由 luci-app-1panel 生成，重新安装或更新会覆盖这份文件。"
+		echo "services:"
+		echo "  $CT_NAME:"
+		echo "    image: $(yaml_q "$IMAGE_C")"
+		echo "    container_name: $CT_NAME"
+		echo "    hostname: 1PanelServer"
+		echo "    restart: unless-stopped"
+		echo "    network_mode: host"
+		echo "    environment:"
+		echo "      TZ: $(yaml_q "$tz")"
+		echo "      BASE_DIR: $(yaml_q "$DATADIR_C")"
+		echo "      PORT: $(yaml_q "$PORT_C")"
+		echo "      ENTRANCE: $(yaml_q "$ENT_C")"
+		echo "      USERNAME: $(yaml_q "$USER_C")"
+		echo "      PASSWORD: $(yaml_q "$PASS_C")"
+		echo "    volumes:"
+		echo "      - '/var/run/docker.sock:/var/run/docker.sock'"
+		echo "      - '$mnt_opt'"
+		echo "      - '/sys/fs/cgroup:/sys/fs/cgroup'"
+		# 不挂 /etc/localtime：OpenWrt 上它是指向 /usr/share/zoneinfo/ 的符号链接，
+		# 目标常常不存在（zoneinfo 没装），Docker 创建挂载源时会 mkdir 已存在的路径，
+		# 报 "mkdir /etc/localtime: file exists" 直接起不来。
+		# 时区已经由上面的 TZ 环境变量给了，容器内 glibc / Go 都认，不需要再挂文件。
+		if [ "$root" = "1" ]; then
+			echo "      # 「挂载 root 路径」勾选后加的一行，作用是面板里能浏览整机文件"
+			echo "      - '/:/ahost'"
+		fi
+	} >"$f" || return 1
+
+	# 里面有明文密码（首次初始化用），别给全局可读。
+	chmod 600 "$f"
+	return 0
+}
+
+# ---------------------------------------------------------------- 面板探测
+# 面板的端口、入口、版本以面板自己的数据库为准：重装或沿用旧数据时，表单里
+# 填的值可能没生效（install.sh 走 USE_EXISTING），只有这里读到的是真的。
+PROBE_PORT=""
+PROBE_ENT=""
+PROBE_VER=""
+PROBE_USER=""
+
+probe_panel() {
+	local raw line addr ver u
+
+	PROBE_PORT=""
+	PROBE_ENT=""
+	PROBE_VER=""
+	PROBE_USER=""
+
+	case "$1" in
+		container)
+			ct_running || return 1
+			raw=$(timeout 15 docker exec "$CT_NAME" sh -c \
+				"$BIN_DIR/1pctl version 2>/dev/null; echo @@; $BIN_DIR/1pctl user-info 2>/dev/null" 2>/dev/null)
+			;;
+		native)
+			native_installed || return 1
+			raw=$(timeout 15 sh -c \
+				"$BIN_DIR/1pctl version 2>/dev/null; echo @@; $BIN_DIR/1pctl user-info 2>/dev/null" 2>/dev/null)
+			;;
+		*) return 1 ;;
+	esac
+
+	[ -n "$raw" ] || return 1
+
+	ver=$(printf '%s\n' "$raw" | sed -n '1,/^@@$/p' | pick_version)
+	addr=$(printf '%s\n' "$raw" | sed -n 's#.*://[^:/ ]*:\([0-9][0-9]*\)/\([^ ]*\).*#\1 \2#p' | head -n1)
+
+	# user-info 的第二行是「面板用户: xxx」/「Panel user: xxx」，标签随语言变，
+	# 但冒号后面的用户名不变，所以按最后一个 ": " 切。@@ 之后依次是
+	# 地址行、用户行、密码行、提示行，取第 3 行。
+	line=$(printf '%s\n' "$raw" | sed -n '/^@@$/,$p' | sed -n '3p')
+	case "$line" in
+		*": "*) PROBE_USER=${line##*: } ;;
+	esac
+	case "$PROBE_USER" in
+		*"://"* | *" "*) PROBE_USER="" ;;
+	esac
+
+	PROBE_VER="$ver"
+	if [ -n "$addr" ]; then
+		PROBE_PORT=${addr%% *}
+		PROBE_ENT=${addr#* }
+		PROBE_ENT=${PROBE_ENT%/}
+	fi
+	return 0
+}
+
+url_of() {
+	# $1=port $2=entrance
+	if [ -n "$2" ]; then
+		echo "http://$(lan_ip):$1/$2"
+	else
+		echo "http://$(lan_ip):$1"
+	fi
+}
+
+# ---------------------------------------------------------------- 状态
+cmd_status() {
+	local kind conflict cstate npresent nrunning
+	local cport cent cver cdir cimg croot cuser
+	local nport nent nver npidd
+
+	cstate=$(ct_state 2>/dev/null)
+	npresent=0
+	native_installed && npresent=1
+	nrunning=0
+	native_running && nrunning=1
+
+	if [ -n "$cstate" ] && [ "$npresent" = "1" ]; then
+		conflict=1
+	else
+		conflict=0
+	fi
+	if [ -n "$cstate" ] && { [ "$cstate" = "running" ] || [ "$npresent" = "0" ]; }; then
+		kind="container"
+	elif [ "$npresent" = "1" ]; then
+		kind="native"
+	elif [ -n "$cstate" ]; then
+		kind="container"
+	else
+		kind="none"
+	fi
+
+	echo "kind=$kind"
+	echo "conflict=$conflict"
+	echo "latest=$(cached_remote_version)"
+	echo "task=$(task_phase)"
+	echo "arch=$(arch_name)"
+	echo "hostname=$(uci -q get system.@system[0].hostname)"
+	echo "docker=$(docker_live && echo 1 || echo 0)"
+	echo "bash=$(command -v bash >/dev/null 2>&1 && echo 1 || echo 0)"
+
+	disk_info
+	cmd_disks
+
+	# ---- 容器版 ----
+	cport="$PORT_C"
+	cent="$ENT_C"
+	cver=""
+	cdir="$DATADIR_C"
+	cimg=""
+	croot="$ROOTPATH_C"
+	cuser="$USER_C"
+
+	if [ -n "$cstate" ]; then
+		cimg=$(docker inspect --format '{{.Config.Image}}' "$CT_NAME" 2>/dev/null)
+		[ -n "$cimg" ] || cimg="$IMAGE_C"
+		croot=$(grep -qs "/:/ahost" "$COMPOSE_FILE" && echo 1 || echo 0)
+		cport=$(ct_env PORT)
+		[ -n "$cport" ] || cport="$PORT_C"
+		cent=$(ct_env ENTRANCE)
+		cuser=$(ct_env USERNAME)
+		[ -n "$cuser" ] || cuser="$USER_C"
+		cdir=$(ct_env BASE_DIR)
+		[ -n "$cdir" ] || cdir="$DATADIR_C"
+		if probe_panel container; then
+			[ -n "$PROBE_PORT" ] && cport="$PROBE_PORT"
+			[ -n "$PROBE_ENT" ] && cent="$PROBE_ENT"
+			[ -n "$PROBE_USER" ] && cuser="$PROBE_USER"
+			cver="$PROBE_VER"
+		fi
+	fi
+
+	echo "container_present=$([ -n "$cstate" ] && echo 1 || echo 0)"
+	echo "container_running=$([ "$cstate" = "running" ] && echo 1 || echo 0)"
+	echo "container_state=${cstate}"
+	echo "container_image=$cimg"
+	echo "container_datadir=$cdir"
+	echo "container_port=$cport"
+	echo "container_entrance=$cent"
+	echo "container_username=$cuser"
+	echo "container_version=$cver"
+	echo "container_rootpath=$croot"
+
+	# ---- 本地版 ----
+	nport="$PORT_N"
+	nent="$ENT_N"
+	nver=""
+	nuser="$USER_N"
+	npidd=""
+
+	if [ "$npresent" = "1" ]; then
+		nport=$(cfg_def main.port 10086)
+		# 服务停着也能读：1pctl 只是打开数据库，不需要进程在跑。
+		if probe_panel native; then
+			[ -n "$PROBE_PORT" ] && nport="$PROBE_PORT"
+			[ -n "$PROBE_ENT" ] && nent="$PROBE_ENT"
+			[ -n "$PROBE_USER" ] && nuser="$PROBE_USER"
+			nver="$PROBE_VER"
+		fi
+		[ "$nrunning" = "1" ] && npidd=$(core_pid)
+	fi
+
+	echo "native_present=$npresent"
+	echo "native_running=$nrunning"
+	echo "native_pid=$npidd"
+	echo "native_datadir=$DATADIR_N"
+	echo "native_port=$nport"
+	echo "native_entrance=$nent"
+	echo "native_username=$nuser"
+	echo "native_version=$nver"
+	echo "native_datakept=$([ -f "$RUN_DIR_N/db/core.db" ] && echo 1 || echo 0)"
+
+	# ---- 当前这套的合并视图（页面直接用这些）----
+	case "$kind" in
+		container)
+			echo "installed=1"
+			echo "running=$([ "$cstate" = "running" ] && echo 1 || echo 0)"
+			echo "port=$cport"
+			echo "username=$cuser"
+			echo "entrance=$cent"
+			echo "datadir=$cdir"
+			echo "rundir=$RUN_DIR_C"
+			echo "address=$(url_of "$cport" "$cent")"
+			echo "version=$cver"
+			echo "pid="
+			echo "listening=$(port_listening "$cport" && echo 1 || echo 0)"
+			;;
+		native)
+			echo "installed=1"
+			echo "running=$nrunning"
+			echo "port=$nport"
+			echo "username=$nuser"
+			echo "entrance=$nent"
+			echo "datadir=$DATADIR_N"
+			echo "rundir=$RUN_DIR_N"
+			echo "address=$(url_of "$nport" "$nent")"
+			echo "version=$nver"
+			echo "pid=$npidd"
+			echo "listening=$(port_listening "$nport" && echo 1 || echo 0)"
+			;;
+		*)
+			echo "installed=0"
+			echo "running=0"
+			echo "port=$PORT_N"
+			echo "username=$USER_N"
+			echo "entrance=$ENT_N"
+			echo "datadir=$DATADIR_N"
+			echo "rundir=$RUN_DIR_N"
+			echo "address=$(url_of "$PORT_N" "$ENT_N")"
+			echo "version="
+			echo "pid="
+			echo "listening=0"
+			;;
+	esac
+
+	echo "datakept=$([ -f "$RUN_DIR_N/db/core.db" ] && echo 1 || echo 0)"
+	echo "container_datakept=$([ -f "$RUN_DIR_C/db/core.db" ] && echo 1 || echo 0)"
+
+	return 0
+}
+
+# 数据目录候选：只列 /mnt 下真正挂着盘的挂载点，直接读写 /mnt/xxx 才会落盘，
+# 写在 overlay 上的东西刷机就没了。
+cmd_disks() {
+	df -k 2>/dev/null | awk 'NR>1 && $6 ~ /^\/mnt\// {print "disk=" $6 ":" $4}'
+	return 0
+}
+
+cmd_latest() {
+	local v
+
+	mkdir -p "$TASK_DIR"
+
+	v=$(remote_version)
+	if [ -n "$v" ]; then
+		echo "$v" >"$TASK_DIR/latest"
+	else
+		v=$(cached_remote_version)
+	fi
+
+	echo "latest=$v"
+	echo "current=$(cmd_version_of_active)"
+	return 0
+}
+
+cmd_version_of_active() {
+	if ct_present; then
+		probe_panel container && echo "$PROBE_VER"
+	elif native_installed; then
+		probe_panel native && echo "$PROBE_VER"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- 后台任务
+SELF=$(readlink -f "$0" 2>/dev/null)
+[ -n "$SELF" ] || SELF="$0"
+
+spawn_task() {
+	local phase="$1"
+	local label="$2"
+	local log="$TASK_DIR/log"
+
+	shift 2
+
+	mkdir -p "$TASK_DIR"
+	: >"$log"
+	set_phase "$phase"
+
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$SELF" "$@" </dev/null >>"$log" 2>&1 &
+	else
+		("$SELF" "$@" </dev/null >>"$log" 2>&1 &)
+	fi
+
+	echo "已开始：$label"
+	echo "任务在后台执行，完成后刷新本页；日志：$log"
+	return 0
+}
+
+# ---------------------------------------------------------------- 本地版安装
+worker_install() {
+	local ver arch url tmp pkg dir
+
+	ver="$1"
+	[ -n "${2:-}" ] && PORT_N="$2"
+	[ -n "${3:-}" ] && USER_N="$3"
+	[ -n "${4:-}" ] && ENT_N="$4"
+	[ -n "${5:-}" ] && DATADIR_N="$5"
+	RUN_DIR_N="$DATADIR_N/1panel"
+
+	arch=$(arch_name)
+	tmp="$DATADIR_N/.setup"
+
+	if [ -z "$arch" ]; then
+		set_phase "error:不支持的架构 $(uname -m)"
+		return 1
+	fi
+
+	rm -rf "$tmp"
+	mkdir -p "$tmp" || {
+		set_phase "error:无法创建临时目录 $tmp"
+		return 1
+	}
+
+	url="$BASE_URL/$ver/release/1panel-$ver-linux-$arch.tar.gz"
+
+	echo "== 下载 $url"
+	set_phase "downloading:$ver"
+	if ! curl -fL --retry 2 --connect-timeout 15 -o "$tmp/pkg.tar.gz" "$url"; then
+		set_phase "error:下载失败"
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	echo "== 解包"
+	set_phase "extracting:$ver"
+	mkdir -p "$tmp/x" || { set_phase "error:解包目录创建失败"; return 1; }
+	if ! tar zxf "$tmp/pkg.tar.gz" -C "$tmp/x"; then
+		set_phase "error:解包失败（文件可能不完整）"
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	pkg=$(find "$tmp/x" -maxdepth 2 -name install.sh -type f | head -n1)
+	[ -n "$pkg" ] || {
+		set_phase "error:包里没有 install.sh"
+		rm -rf "$tmp"
+		return 1
+	}
+	dir=$(dirname "$pkg")
+
+	echo "== 安装到 $DATADIR_N"
+	set_phase "installing:$ver"
+
+	set -- --non-interactive --lang zh --install-dir "$DATADIR_N" --install-docker n
+	[ -n "$PORT_N" ] && set -- "$@" --port "$PORT_N"
+	[ -n "$ENT_N" ] && set -- "$@" --entrance "$ENT_N"
+	[ -n "$USER_N" ] && set -- "$@" --username "$USER_N"
+	[ -n "${P1_PASS:-}" ] && set -- "$@" --password "$P1_PASS"
+
+	(
+		cd "$dir" || exit 1
+		bash ./install.sh "$@"
+	) || echo "== install.sh 返回非 0（apk 系统上的已知误判），继续自行校验"
+
+	echo "== 等待服务就绪"
+	set_phase "starting:$ver"
+
+	local i=0
+	while [ $i -lt 30 ]; do
+		native_running && port_listening "$PORT_N" && break
+		i=$((i + 1))
+		sleep 2
+	done
+
+	rm -rf "$tmp"
+
+	if native_running; then
+		echo "== 完成：$(probe_panel native && echo "$PROBE_VER")"
+		set_phase "done:$ver"
+		return 0
+	fi
+
+	set_phase "error:服务没有起来，看日志 /var/log/1panel-core.log"
+	return 1
+}
+
+worker_update() {
+	local ver before after
+
+	probe_panel native
+	before="$PROBE_VER"
+	ver=$(remote_version)
+	[ -n "$ver" ] || ver="latest"
+
+	echo "== 升级到 $ver（当前 $before）"
+	set_phase "updating:$ver"
+
+	"$BIN_DIR/1pctl" update </dev/null
+
+	local i=0
+	while [ $i -lt 30 ]; do
+		native_running && port_listening "$PORT_N" && break
+		i=$((i + 1))
+		sleep 2
+	done
+
+	if ! native_running; then
+		set_phase "error:升级后服务没有起来，看下面的日志"
+		return 1
+	fi
+
+	probe_panel native
+	after="$PROBE_VER"
+
+	if [ -n "$ver" ] && [ "$ver" != "latest" ] && [ "$(vnum "$after")" != "$(vnum "$ver")" ]; then
+		echo "== 版本仍是 $after，官方升级没有生效"
+		set_phase "error:升级未生效（仍是 $after），日志见上方"
+		return 1
+	fi
+
+	echo "== 完成：$after"
+	set_phase "done:$after"
+	return 0
+}
+
+cmd_install() {
+	local overlay_kb
+
+	[ -n "${1:-}" ] && PORT_N="$1"
+	[ -n "${2:-}" ] && USER_N="$2"
+	[ -n "${3:-}" ] && ENVPASS="$3"
+	[ -n "${4:-}" ] && ENT_N="$4"
+	[ -n "${5:-}" ] && DATADIR_N="$5"
+	RUN_DIR_N="$DATADIR_N/1panel"
+
+	case "$DATADIR_N" in
+		/mnt/*) ;;
+		*)
+			echo "数据目录必须位于 /mnt 下（当前：$DATADIR_N）" >&2
+			echo "面板的数据库、日志、备份都写这里；放 overlay 会写满 flash，刷机也会丢。" >&2
+			return 2
+			;;
+	esac
+
+	case "$PORT_N" in
+		'' | *[!0-9]*)
+			echo "端口必须是数字（当前：$PORT_N）" >&2
+			return 1
+			;;
+	esac
+
+	if ct_present; then
+		echo "已安装容器版 1Panel（容器 $CT_NAME）。" >&2
+		echo "两套会抢同一个端口和数据目录，请先在「容器安装」里卸载它。" >&2
+		return 4
+	fi
+
+	# 已有数据库时 install.sh 走 USE_EXISTING：账号、密码、入口都沿用旧值，
+	# 表单里填什么都不生效。所以重装时允许留空，并且要提前说清楚。
+	if [ -f "$RUN_DIR_N/db/core.db" ]; then
+		echo "检测到已有数据：$RUN_DIR_N/db/core.db"
+		echo "账号 / 密码 / 入口会沿用数据库里的旧值，表单里的值不生效。"
+		echo "要用新值，先卸载并删掉数据目录再装。"
+	else
+		[ -n "$USER_N" ] || { echo "用户名不能为空" >&2; return 1; }
+		[ ${#ENVPASS} -ge 8 ] || { echo "密码至少 8 位" >&2; return 1; }
+		[ -n "$ENT_N" ] || { echo "入口路径不能为空（别用 admin/1panel 这类）" >&2; return 1; }
+	fi
+
+	[ -z "$(arch_name)" ] && { echo "不支持的架构：$(uname -m)" >&2; return 1; }
+
+	need_bash || return 1
+
+	if native_installed; then
+		echo "已经安装过（$BIN_DIR/1pctl 存在）。重装请先卸载，或直接点「更新」。" >&2
+		return 1
+	fi
+
+	overlay_kb=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+	if [ -n "$overlay_kb" ] && [ "$overlay_kb" -lt 204800 ]; then
+		echo "overlay 剩余不足 200MB（当前 $((overlay_kb / 1024))MB），装完会很紧张：" >&2
+		echo "两个二进制约 152MB 要写进 /usr/local/bin。" >&2
+		return 3
+	fi
+
+	mkdir -p "$DATADIR_N" || { echo "无法创建 $DATADIR_N" >&2; return 1; }
+	save_cfg main "datadir=$DATADIR_N" "port=$PORT_N" "username=$USER_N"
+	[ -n "$ENT_N" ] && save_cfg main "entrance=$ENT_N"
+
+	local ver
+	ver=$(remote_version)
+	[ -n "$ver" ] || {
+		echo "取不到最新版本号（网络不通？），稍后再试" >&2
+		return 1
+	}
+
+	export P1_PASS="${ENVPASS:-}"
+
+	spawn_task "downloading:$ver" "安装 1Panel $ver（本地版）" \
+		_worker_install "$ver" "$PORT_N" "$USER_N" "$ENT_N" "$DATADIR_N"
+
+	return 0
+}
+
+cmd_update() {
+	local cur ver
+
+	native_installed || { echo "还没有安装本地版 1Panel" >&2; return 1; }
+	need_bash || return 1
+
+	probe_panel native
+	cur="$PROBE_VER"
+	ver=$(remote_version)
+
+	if [ -n "$ver" ] && [ "$(vnum "$cur")" = "$(vnum "$ver")" ]; then
+		echo "已经是最新版：$cur"
+		return 0
+	fi
+
+	spawn_task "updating:${ver:-latest}" "升级到 ${ver:-最新版}" _worker_update
+	return 0
+}
+
+cmd_remove() {
+	local purge="${1:-}"
+
+	[ -x "$INIT_DIR/1panel-agent" ] && "$INIT_DIR/1panel-agent" stop >/dev/null 2>&1
+	[ -x "$INIT_DIR/1panel-core" ] && "$INIT_DIR/1panel-core" stop >/dev/null 2>&1
+	[ -x "$INIT_DIR/1panel-agent" ] && "$INIT_DIR/1panel-agent" disable >/dev/null 2>&1
+	[ -x "$INIT_DIR/1panel-core" ] && "$INIT_DIR/1panel-core" disable >/dev/null 2>&1
+
+	rm -f "$INIT_DIR/1panel-core" "$INIT_DIR/1panel-agent"
+	rm -f /etc/rc.d/S95_1panel-core /etc/rc.d/K15_1panel-core \
+		/etc/rc.d/S96_1panel-agent /etc/rc.d/K14_1panel-agent
+
+	rm -f "$BIN_DIR/1panel-core" "$BIN_DIR/1panel-agent" "$BIN_DIR/1pctl"
+	rm -rf "$BIN_DIR/lang"
+	rm -f /usr/bin/1panel /usr/bin/1panel-core /usr/bin/1panel-agent /usr/bin/1pctl
+
+	if [ "$purge" = "purge" ]; then
+		rm -rf "$RUN_DIR_N"
+		echo "已卸载程序并删除数据：$RUN_DIR_N"
+	else
+		echo "已卸载程序，数据保留在：$RUN_DIR_N"
+	fi
+
+	return 0
+}
+
+cmd_logs() {
+	if [ -s "$TASK_DIR/log" ]; then
+		echo "== 任务日志 =="
+		tail -n 40 "$TASK_DIR/log"
+		echo
+	fi
+	echo "== 服务日志 =="
+	logread 2>/dev/null | grep -i "1panel" | tail -n 40
+}
+
+# ---------------------------------------------------------------- 容器版动作
+cmd_ct_install() {
+	local root over_kb
+
+	[ -n "${1:-}" ] && PORT_C="$1"
+	[ -n "${2:-}" ] && USER_C="$2"
+	[ -n "${3:-}" ] && PASS_C="$3"
+	[ -n "${4:-}" ] && ENT_C="$4"
+	[ -n "${5:-}" ] && DATADIR_C="$5"
+	[ -n "${6:-}" ] && ROOTPATH_C="$6"
+	[ -n "${7:-}" ] && IMAGE_C="$7"
+
+	COMPOSE_FILE="$DATADIR_C/docker-compose.yml"
+	RUN_DIR_C="$DATADIR_C/1panel"
+
+	case "$DATADIR_C" in
+		/mnt/*) ;;
+		*)
+			echo "数据目录必须位于 /mnt 下（当前：$DATADIR_C）" >&2
+			return 2
+			;;
+	esac
+
+	case "$PORT_C" in
+		'' | *[!0-9]*) echo "端口必须是数字（当前：$PORT_C）" >&2; return 1 ;;
+	esac
+
+	case "$ENT_C" in
+		'' | *[!A-Za-z0-9._-]*)
+			echo "入口路径只能用字母、数字、点、下划线和连字符（当前：$ENT_C）" >&2
+			return 1
+			;;
+	esac
+
+	case "$USER_C" in
+		'' | *[!A-Za-z0-9._@-]*)
+			echo "账号只能用字母、数字、点、下划线、@ 和连字符（当前：$USER_C）" >&2
+			return 1
+			;;
+	esac
+
+	if [ ${#PASS_C} -lt 8 ]; then
+		echo "密码至少 8 位" >&2
+		return 1
+	fi
+
+	if native_installed; then
+		echo "已安装本地版 1Panel（$BIN_DIR/1pctl）。" >&2
+		echo "两套会抢同一个端口和数据目录，请先在「本地安装」里卸载它。" >&2
+		return 4
+	fi
+
+	docker_live || {
+		echo "Docker 没在跑：容器版需要 docker（/var/run/docker.sock）。" >&2
+		return 1
+	}
+
+	if [ -e "$RUN_DIR_C/db/core.db" ]; then
+		echo "检测到已有面板数据：$RUN_DIR_C/db/core.db"
+		echo "镜像是首次初始化时才写账号/入口的，已有数据会沿用旧值。"
+	fi
+
+	# 镜像约 175MB，落在 docker 的根目录下，先看一眼够不够。
+	over_kb=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null |
+		while read -r r; do df -k "$r" 2>/dev/null | awk 'NR==2 {print $4}'; done)
+	if [ -n "$over_kb" ] && [ "$over_kb" -lt 307200 ]; then
+		echo "Docker 数据盘剩余不足 300MB（当前 $((over_kb / 1024))MB），拉不动 175MB 的镜像。" >&2
+		return 3
+	fi
+
+	mkdir -p "$DATADIR_C" || { echo "无法创建 $DATADIR_C" >&2; return 1; }
+
+	compose_write "$COMPOSE_FILE" "$ROOTPATH_C" || {
+		echo "写不了 $COMPOSE_FILE" >&2
+		return 1
+	}
+
+	save_cfg container "datadir=$DATADIR_C" "port=$PORT_C" "username=$USER_C" \
+		"entrance=$ENT_C" "image=$IMAGE_C" "rootpath=$ROOTPATH_C"
+
+	# 密码只留在 compose 文件里（0600）和这个后台进程的环境里，不进 uci。
+	# 走 docker run 兜底时要用它。
+	export P1_PASS="$PASS_C"
+
+	spawn_task "pulling:$IMAGE_C" "拉取镜像并启动 $IMAGE_C" _worker_ct_up
+	return 0
+}
+
+worker_ct_up() {
+	local i=0
+
+	if compose_bin >/dev/null 2>&1; then
+		echo "== compose pull"
+		set_phase "pulling:$IMAGE_C"
+		compose pull || echo "== pull 有告警，继续 up（本地可能已有该镜像）"
+
+		echo "== compose up -d"
+		set_phase "starting:$IMAGE_C"
+		compose up -d || {
+			set_phase "error:compose up 失败，看上面的输出"
+			return 1
+		}
+	else
+		echo "== 没有 docker compose，退回 docker run"
+		set_phase "pulling:$IMAGE_C"
+		docker pull "$IMAGE_C" || echo "== pull 有告警，继续"
+
+		set_phase "starting:$IMAGE_C"
+		docker rm -f "$CT_NAME" >/dev/null 2>&1
+		set -- docker run -d --name "$CT_NAME" --hostname 1PanelServer \
+			--restart unless-stopped --network host \
+			-e "TZ=$(uci -q get system.@system[0].zonename 2>/dev/null || echo Asia/Shanghai)" \
+			-e "BASE_DIR=$DATADIR_C" -e "PORT=$PORT_C" \
+			-e "ENTRANCE=$ENT_C" -e "USERNAME=$USER_C" \
+			-e "PASSWORD=${P1_PASS:-$PASS_C}" \
+			-v /var/run/docker.sock:/var/run/docker.sock \
+			-v /mnt:/mnt -v /sys/fs/cgroup:/sys/fs/cgroup
+		[ "$ROOTPATH_C" = "1" ] && set -- "$@" -v /:/ahost
+		"$@" "$IMAGE_C" || {
+			set_phase "error:docker run 失败，看上面的输出"
+			return 1
+		}
+	fi
+
+	echo "== 等面板起来（首次初始化要写数据库，可能一分多钟）"
+	set_phase "starting:$IMAGE_C"
+
+	while [ $i -lt 60 ]; do
+		if ct_running && port_listening "$PORT_C"; then
+			break
+		fi
+		i=$((i + 1))
+		sleep 3
+	done
+
+	if ! ct_running; then
+		echo "== 容器没起来"
+		docker logs --tail 40 "$CT_NAME" 2>&1
+		set_phase "error:容器没起来，看上面的日志"
+		return 1
+	fi
+
+	if probe_panel container; then
+		echo "== 完成：$PROBE_VER"
+		echo "== 访问：$(url_of "$PROBE_PORT" "$PROBE_ENT")"
+		set_phase "done:${PROBE_VER:-$IMAGE_C}"
+		return 0
+	fi
+
+	echo "== 容器在跑，但面板还没响应（首次初始化可能还在进行）"
+	echo "== 过一会儿刷新页面再看"
+	set_phase "done:$IMAGE_C"
+	return 0
+}
+
+cmd_ct_update() {
+	local ver
+
+	ct_present || { echo "还没有安装容器版 1Panel" >&2; return 1; }
+	docker_live || { echo "Docker 没在跑" >&2; return 1; }
+
+	ver=$(remote_version)
+	spawn_task "updating:${ver:-latest}" "拉取新镜像并重建容器" _worker_ct_up
+	return 0
+}
+
+cmd_ct_lifecycle() {
+	local act="$1"
+
+	ct_present || { echo "还没有安装容器版 1Panel" >&2; return 1; }
+
+	if compose_bin >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
+		compose "$act" 2>&1 || docker "$act" "$CT_NAME" 2>&1
+	else
+		docker "$act" "$CT_NAME" 2>&1
+	fi
+	return 0
+}
+
+cmd_ct_remove() {
+	local purge="${1:-}" dir
+
+	dir="$DATADIR_C"
+
+	if ct_present; then
+		if compose_bin >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
+			compose down >/dev/null 2>&1
+		fi
+		docker rm -f "$CT_NAME" >/dev/null 2>&1
+	fi
+
+	if [ "$purge" = "purge" ]; then
+		rm -rf "$dir/1panel" "$dir/docker-compose.yml"
+		echo "已卸载容器并删除数据：$dir/1panel"
+	else
+		echo "已卸载容器，数据保留在：$dir/1panel"
+		echo "（用新账号/入口重装前，记得先删掉它，否则镜像会沿用旧数据）"
+	fi
+
+	return 0
+}
+
+cmd_ct_logs() {
+	if [ -s "$TASK_DIR/log" ]; then
+		echo "== 任务日志 =="
+		tail -n 40 "$TASK_DIR/log"
+		echo
+	fi
+
+	echo "== 容器日志 =="
+	docker logs --tail 60 "$CT_NAME" 2>&1
+}
+
+# ---------------------------------------------------------------- 入口
+case "${1:-}" in
+	status) cmd_status ;;
+	latest) cmd_latest ;;
+	disks) cmd_disks ;;
+	install) cmd_install "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" ;;
+	update) cmd_update ;;
+	start | stop | restart)
+		native_installed || { echo "本地版 1Panel 未安装" >&2; exit 1; }
+		[ -x "$INIT_DIR/1panel-core" ] && "$INIT_DIR/1panel-core" "$1" 2>&1
+		[ -x "$INIT_DIR/1panel-agent" ] && "$INIT_DIR/1panel-agent" "$1" 2>&1
+		;;
+	remove) cmd_remove "${2:-}" ;;
+	logs) cmd_logs ;;
+	container)
+		case "${2:-}" in
+			install) shift 2; cmd_ct_install "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
+			update) cmd_ct_update ;;
+			start | stop | restart) cmd_ct_lifecycle "$2" ;;
+			remove) cmd_ct_remove "${3:-}" ;;
+			logs) cmd_ct_logs ;;
+			*) echo "用法：1panel-ctl container install|update|start|stop|restart|remove [purge]|logs" >&2; exit 1 ;;
+		esac
+		;;
+	_worker_install) shift; worker_install "$@" ;;
+	_worker_update) worker_update ;;
+	_worker_ct_up) worker_ct_up ;;
+	*)
+		cat >&2 <<-EOF
+			用法：1panel-ctl <命令>
+
+			  status                       两套后端的完整状态
+			  latest                       查远端最新版本
+			  disks                        /mnt 下的数据目录候选
+
+			  container install <端口> <账号> <密码> <入口> <数据目录> <rootpath 0|1> [镜像]
+			  container update|start|stop|restart
+			  container remove [purge]
+			  container logs
+
+			  install <端口> <账号> <密码> <入口> <数据目录>
+			  update|start|stop|restart
+			  remove [purge]
+			  logs
+		EOF
+		exit 1
+		;;
+esac
+
+# 各分支的返回值要带出去：install 的 2/3/4 表示目录不合规、空间不足、另一套
+# 已安装，页面据此提示，不能被一个固定 exit 0 吞掉。
+exit $?

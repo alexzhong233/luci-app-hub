@@ -1,0 +1,15 @@
+
+config hub 'global'
+	option datadir '/mnt/sda1/Configs/services'
+
+config service 'qbittorrent'
+	option variant 'luci'
+	option port '8090'
+	option bt_port '21142'
+	option network 'host'
+	option downloads '/mnt/sda1/movie'
+
+config service 'openlist'
+	option variant 'openlist2'
+	option port '5244'
+	option network 'host'
