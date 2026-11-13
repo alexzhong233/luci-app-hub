@@ -991,6 +991,36 @@ ol_native_running() {
 	[ -x "/etc/init.d/$k" ] && "/etc/init.d/$k" status >/dev/null 2>&1
 }
 
+# OpenList 的 config.json 里 database.db_file 和 bleve_dir 都是绝对路径：
+#   原生版  --data /etc/openlist2       → /etc/openlist2/data.db
+#   容器版  挂 <datadir>:/opt/openlist/data → /opt/openlist/data/data.db
+# 两边挂的是同一份 config.json，路径不改过去，切过去就会「找不到库、新建一个空库」
+# —— 表现就是配置全丢。
+ol_fix_paths() {
+	local f prefix
+
+	f="$(ol_datadir)/config.json"
+	[ -f "$f" ] || return 0
+
+	prefix="$1"
+	[ -n "$prefix" ] || return 0
+
+	sed -i \
+		-e "s#\"db_file\"[[:space:]]*:[[:space:]]*\"[^\"]*\"#\"db_file\": \"$prefix/data.db\"#" \
+		-e "s#\"bleve_dir\"[[:space:]]*:[[:space:]]*\"[^\"]*\"#\"bleve_dir\": \"$prefix/bleve\"#" \
+		"$f" 2>/dev/null
+	return 0
+}
+
+# 按运行方式把路径摆正
+ol_apply_paths() {
+	case "$1" in
+	docker) ol_fix_paths /opt/openlist/data ;;
+	feeds) ol_fix_paths /etc/openlist ;;
+	*) ol_fix_paths /etc/openlist2 ;;
+	esac
+}
+
 ol_compose_write() {
 	local f port net dir img
 
@@ -1198,6 +1228,7 @@ ol_worker_install() {
 		;;
 	docker)
 		echo "== 容器版"
+		ol_apply_paths docker
 		ol_compose_write || {
 			set_phase "error:写 compose 失败"
 			return 1
@@ -1215,6 +1246,7 @@ ol_worker_install() {
 	esac
 
 	# 原生版把 datadir 铺回去（包刚建的空目录）；容器版直接挂 datadir
+	ol_apply_paths "$v"
 	case "$v" in
 	docker) ;;
 	feeds) sync_push "$(ol_datadir)" /etc/openlist >/dev/null 2>&1 ;;
@@ -1237,6 +1269,10 @@ ol_start() {
 	v=$(ol_variant)
 	k=$(ol_native_kind)
 	[ -n "$k" ] || k="$v"
+
+	# 先把 config.json 里的库路径摆成这个运行方式该有的样子，再往下同步 ——
+	# 顺序反了的话 sync_push 会把旧路径一起铺到 /etc，原生版就找不到库了。
+	ol_apply_paths "$v"
 
 	# 原生版：datadir 那份铺到 /etc。
 	# 刷机后 /etc 是包自带的初始库、datadir 还在 /mnt 上 —— 以 datadir 为准；
