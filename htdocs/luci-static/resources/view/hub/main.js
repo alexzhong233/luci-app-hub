@@ -355,10 +355,10 @@ return view.extend({
 			out.textContent = text || _('（无输出）');
 		}
 
-		function run(tool, args, label) {
+		function run(tool, args, label, env) {
 			setOut(_('正在执行：') + label + ' ...');
 
-			return call(tool, args).then(function(res) {
+			return call(tool, args, env).then(function(res) {
 				setOut('$ ' + tool.split('/').pop() + ' ' + args.join(' ') + '\n\n'
 					+ (res.text || _('（无输出）')));
 
@@ -759,7 +759,12 @@ return view.extend({
 
 			if (!installed) {
 				ops.push(button(_('安装 %s').format(mode.title), function() {
-					return run(HUB, [ 'install', 'qbittorrent', v ], _('安装 qBittorrent'));
+					/* 通用设置里填了密码就一起带过去，装完由 hub-ctl 写进
+					   qB（走环境变量，不出现在命令行里） */
+					var p = (inputs.qb.pass && inputs.qb.pass.value || '').trim();
+
+					return run(HUB, [ 'install', 'qbittorrent', v ],
+						_('安装 qBittorrent'), p ? { HUB_PASS: p } : null);
 				}, { primary: true, disabled: inFlight }));
 			}
 			else {
@@ -998,7 +1003,10 @@ return view.extend({
 
 			if (!installed) {
 				ops.push(button(_('安装 %s').format(mode.title), function() {
-					return run(HUB, [ 'install', 'openlist', v ], _('安装 OpenList'));
+					var p = (inputs.ol.pass && inputs.ol.pass.value || '').trim();
+
+					return run(HUB, [ 'install', 'openlist', v ],
+						_('安装 OpenList'), p ? { HUB_PASS: p } : null);
 				}, { primary: true, disabled: inFlight }));
 			}
 			else {

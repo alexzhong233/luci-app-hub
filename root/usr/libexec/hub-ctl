@@ -326,9 +326,51 @@ qb_image() {
 # 原生版在跑时，活的那份在 /etc/qBittorrent（datadir 只是它的副本），
 # 所以先看 /etc；没有原生版（或容器版）时看 datadir。
 qb_conf_file() {
-	local native=/etc/qBittorrent/config/qBittorrent.conf
-	[ -f "$native" ] && { echo "$native"; return; }
-	echo "$(qb_datadir)/config/qBittorrent.conf"
+	local nat=/etc/qBittorrent/config/qBittorrent.conf
+	local dir ctr old cached
+
+	dir=$(qb_datadir)
+	# qB 的 profile 布局是 <profile>/qBittorrent/config/qBittorrent.conf：
+	#   原生版  --profile=/etc      → /etc/qBittorrent/config/qBittorrent.conf
+	#   容器版  --profile=/config   → <数据目录>/config/qBittorrent/config/qBittorrent.conf
+	# 少一层 qBittorrent/ 那个是早期版本写错的位置，留着兼容，读到就用。
+	ctr="$dir/config/qBittorrent/config/qBittorrent.conf"
+	old="$dir/config/qBittorrent.conf"
+
+	[ -f "$nat" ] && { echo "$nat"; return; }
+
+	# 容器版真实路径由镜像的 profile 决定，第一个装上的镜像探测一次就记在
+	# <数据目录>/.confpath，之后直接照着用
+	if [ -s "$dir/.confpath" ]; then
+		cached=$(cat "$dir/.confpath" 2>/dev/null)
+		[ -n "$cached" ] && [ -f "$cached" ] && { echo "$cached"; return; }
+	fi
+
+	[ -f "$ctr" ] && { echo "$ctr"; return; }
+	[ -f "$old" ] && { echo "$old"; return; }
+
+	# 一个都还没有（刚装、容器还没起）时，返回容器版该待的位置
+	echo "$ctr"
+}
+
+# 让容器自己说出 conf 在哪（镜像的 profile 布局不一定和我们的猜测一致）。
+# 只在容器跑着的时候能做，结果写进 <数据目录>/.confpath，之后不再 find。
+qb_conf_probe() {
+	local dir real cache
+
+	dir=$(qb_datadir)
+	cache="$dir/.confpath"
+
+	ct_running "$QBT_CT" || return 0
+
+	real=$(docker exec "$QBT_CT" find /config -name qBittorrent.conf 2>/dev/null | head -n 1)
+	case "$real" in
+	/config/*)
+		real="$dir${real#/config}"
+		[ -f "$real" ] && echo "$real" >"$cache"
+		;;
+	esac
+	return 0
 }
 
 # $1 形如 WebUI\Port / Session\Port —— 用 awk 按整键名比较，反斜杠是普通字符。
@@ -612,6 +654,14 @@ qb_worker_install() {
 	esac
 
 	save_cfg qbittorrent "variant=$v"
+
+	# 页面上填了 WebUI 密码就一起设上（管道来的环境变量，argv 里看不到）。
+	# 放这里是因为密码要等 qB 真的起来才能通过 API 写进去。
+	if [ -n "${HUB_PASS:-}" ]; then
+		echo "== 设置 WebUI 密码"
+		qb_set_password - || echo "!! 密码没设上，稍后可以在页面上重试" >&2
+	fi
+
 	set_phase "done"
 	echo "== 完成"
 }
@@ -621,12 +671,15 @@ qb_worker_install() {
 # datadir 那份是真相，/etc 那份是原生版正在用的副本 —— 两份都要改，
 # 否则下次启动 sync_push 会把 datadir 的旧值盖回去。
 qb_write_conf_port() {
-	local port="$1" bt="$2" dir dirconf conf
+	local port="$1" bt="$2" dir conf
 
 	dir=$(qb_datadir)
-	dirconf="$dir/config/qBittorrent.conf"
 
-	for conf in "$dirconf" /etc/qBittorrent/config/qBittorrent.conf; do
+	# 原生版活的那份、容器版该有的那份、以及早期写错位置的那份，谁在就改谁
+	for conf in \
+		"/etc/qBittorrent/config/qBittorrent.conf" \
+		"$dir/config/qBittorrent/config/qBittorrent.conf" \
+		"$dir/config/qBittorrent.conf"; do
 		[ -f "$conf" ] || continue
 		awk -v p="$port" -v b="$bt" '
 			/^WebUI\\Port=/   { print "WebUI\\Port=" p; next }
@@ -693,14 +746,43 @@ qb_set_password() {
 		return 1
 	}
 	port=$(qb_port)
-	conf="$(qb_datadir)/config/qBittorrent.conf"
+
+	# 容器版：刚起来那几秒内探测不到，等一下再问它 conf 在哪
+	case "$(qb_variant)" in
+	docker | docker-ee)
+		i=0
+		while [ "$i" -lt 15 ]; do
+			ct_running "$QBT_CT" && break
+			sleep 1
+			i=$((i + 1))
+		done
+		;;
+	esac
+	qb_conf_probe
+
+	conf=$(qb_conf_file)
 
 	# 先停：原生版退出时会把内存配置写回 /etc，qb_stop_all 顺手搬进 datadir。
 	# 顺序反了的话刚写进去的白名单会被 /etc 的旧副本覆盖掉。
 	qb_stop_all
 
 	mkdir -p "${conf%/*}" || return 1
-	[ -f "$conf" ] || printf '[LegalNotice]\nAccepted=true\n' >"$conf"
+
+	# 没有 conf 就一次写全：端口、BT 端口、本机免密。
+	# 只写个 [LegalNotice] 的话 qB 会用内置默认端口启动，镜像的 WEBUIPORT
+	# 也只是 sed 已有的行，不会凭空加一行。
+	if [ ! -f "$conf" ]; then
+		{
+			echo '[LegalNotice]'
+			echo 'Accepted=true'
+			echo
+			echo '[Preferences]'
+			echo "WebUI\\Port=$port"
+			echo "Session\\Port=$(qb_bt_port)"
+			echo 'WebUI\\AuthSubnetWhitelistEnabled=true'
+			echo 'WebUI\\AuthSubnetWhitelist=127.0.0.1/32, ::1/128'
+		} >"$conf"
+	fi
 
 	# 本机免密
 	if grep -q '^\[Preferences\]' "$conf"; then
@@ -1112,6 +1194,12 @@ ol_worker_install() {
 	esac
 
 	save_cfg openlist "variant=$v"
+
+	if [ -n "${HUB_PASS:-}" ]; then
+		echo "== 设置管理员密码"
+		ol_set_password - || echo "!! 密码没设上，稍后可以在页面上重试" >&2
+	fi
+
 	set_phase "done"
 	echo "== 完成"
 }
@@ -1223,7 +1311,7 @@ cmd_install() {
 			return 1
 			;;
 		esac
-		spawn_task "installing:$(qb_variant)" "安装 qBittorrent" _worker_qb_install
+		spawn_task "installing:$(qb_variant_label "$(qb_variant)")" "安装 qBittorrent" _worker_qb_install
 		;;
 	openlist)
 		case "$v" in
@@ -1234,7 +1322,7 @@ cmd_install() {
 			return 1
 			;;
 		esac
-		spawn_task "installing:$(ol_variant)" "安装 OpenList" _worker_ol_install
+		spawn_task "installing:$(ol_variant_label "$(ol_variant)")" "安装 OpenList" _worker_ol_install
 		;;
 	*)
 		echo "用法：hub-ctl install qbittorrent|openlist [变体]" >&2
