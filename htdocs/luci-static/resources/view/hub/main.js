@@ -81,7 +81,8 @@ var OL_MODES = [
 		title: _('原生·openlist2'),
 		how: _('sbwml 的 openlist2，带自己的 LuCI 页面'),
 		notes: [
-			_('官方源里没有这个包，安装时从作者的 GitHub release 下预编译包（约 22MB）。'),
+			_('固件里已经预装（openlist2 + 页面 + 中文包）。手动卸掉之后还能在这里装回来：'
+				+ '从作者的 GitHub release 下预编译包，约 22MB。'),
 			_('原生版的数据在 /etc/openlist2，启动时从上面那个通用目录复制过去、停止时写回。'),
 			_('菜单在「NAS → OpenList2」，本页只管装和启停。')
 		]

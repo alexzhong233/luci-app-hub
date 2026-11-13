@@ -557,6 +557,16 @@ sync_pull() {
 	return 0
 }
 
+# datadir 还是空的、原生目录里已经有数据（固件预装 openlist2 就是这样），
+# 先把这份收编进 datadir。否则用户启动一次、数据仍然只写在 overlay 上，刷机就没了。
+adopt_native() {
+	local dir="$1" native="$2"
+
+	has_data "$dir" && return 0
+	has_data "$native" || return 0
+	sync_pull "$native" "$dir"
+}
+
 # 装包前清掉原生目录：apk 往已经存在的目录里解包会报 trying to overwrite，
 # 旧文件也会和新包的初始文件混在一起。数据已经回写进 datadir，删了不丢。
 clear_native_dir() {
@@ -1228,11 +1238,19 @@ ol_start() {
 	k=$(ol_native_kind)
 	[ -n "$k" ] || k="$v"
 
-	# 原生版：datadir 那份铺到 /etc
+	# 原生版：datadir 那份铺到 /etc。
+	# 刷机后 /etc 是包自带的初始库、datadir 还在 /mnt 上 —— 以 datadir 为准；
+	# 反过来（刚预装、datadir 空）先把 /etc 收编进 datadir，别让数据只活在 overlay。
 	case "$v" in
 	docker) ;;
-	openlist2) sync_push "$(ol_datadir)" /etc/openlist2 || echo "!! 数据没铺到 /etc/openlist2" >&2 ;;
-	feeds) sync_push "$(ol_datadir)" /etc/openlist || echo "!! 数据没铺到 /etc/openlist" >&2 ;;
+	openlist2)
+		adopt_native "$(ol_datadir)" /etc/openlist2
+		sync_push "$(ol_datadir)" /etc/openlist2 || echo "!! 数据没铺到 /etc/openlist2" >&2
+		;;
+	feeds)
+		adopt_native "$(ol_datadir)" /etc/openlist
+		sync_push "$(ol_datadir)" /etc/openlist || echo "!! 数据没铺到 /etc/openlist" >&2
+		;;
 	*)
 		case "$k" in
 		openlist2) sync_push "$(ol_datadir)" /etc/openlist2 >/dev/null 2>&1 ;;
