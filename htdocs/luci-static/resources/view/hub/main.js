@@ -300,26 +300,29 @@ function modeOf(list, id) {
 
 return view.extend({
 	load: function() {
+		/* 首屏只读 UCI。
+		 *
+		 * 之前这里还并了 1panel-ctl latest / disks，其中 latest 要 curl
+		 * resource.fit2cloud.com 取远端版本号 —— 那一路走的是同步 exec，
+		 * 网络一慢（路由器上还常是 IPv6 先试）页面就白屏十几秒。
+		 * 现在所有 exec 都挪到 render 之后，页面先出来，数据再补。 */
 		return Promise.all([
 			uci.load('hub'),
 			uci.load('1panel').catch(function() {}),
-			uci.load('workbuddy2api').catch(function() {}),
-			call(CTL_1P, [ 'latest' ]).catch(function() { return { text: '' }; }),
-			call(CTL_1P, [ 'disks' ]).catch(function() { return { text: '' }; }),
-			call(CTL_WB, [ 'disks' ]).catch(function() { return { text: '' }; })
+			uci.load('workbuddy2api').catch(function() {})
 		]);
 	},
 
-	render: function(results) {
+	render: function() {
 		var state = {
 			svc: 'qb',
 			mode: { qb: 'luci', ol: 'openlist2', pn: 'container', wb: 'python' },
 			/* 用户自己点过方式页签就不再自动跳到已装那一栏 */
 			pinned: { qb: false, ol: false, pn: false, wb: false },
 			hub: {}, panel: {}, wb: {},
-			latest: parseKV(results[3] ? results[3].text : '').latest || '',
-			disks: parseDisks(results[4] ? results[4].text : ''),
-			disksWb: parseDisks(results[5] ? results[5].text : ''),
+			latest: '',
+			disks: [],
+			disksWb: [],
 			sig: ''
 		};
 
@@ -555,7 +558,12 @@ return view.extend({
 
 		function qbHead(st) {
 			var running = flag(st.qb_running);
-			var port = st.qb_port || '8090';
+			/* 显示实际在听的端口：conf 里的 WebUI\Port 才是事实，
+			   hub 里配的只是「下次启动写进去的目标值」 */
+			var port = st.qb_live_port || st.qb_port || '8090';
+			var cfgPort = st.qb_port || '';
+			var drift = cfgPort && String(port) !== String(cfgPort);
+			var btPort = st.qb_live_bt_port || st.qb_bt_port || '21142';
 			var net = st.qb_network || 'host';
 			var hostPort = net === 'bridge' ? (st.qb_host_port || port) : port;
 			var kind = st.qb_native;
@@ -583,8 +591,20 @@ return view.extend({
 					: String(port),
 				' ',
 				flag(st.qb_port_busy) ? E('span', { 'class': 'label success' }, [ _('已监听') ])
-					: muted(_('未监听'))
+					: muted(_('未监听')),
+				drift ? E('span', {}, [
+					muted('  ' + _('设置里填的是 ') + cfgPort + _('，qB 自己在听 ') + port
+						+ _('（多半是在 qB 的 WebUI 里改过）。')),
+					button(_('以 %s 为准').format(port), function() {
+						return run(HUB, [ 'setport', String(port), String(btPort) ],
+							_('把端口存为 %s').format(port)).then(function() {
+							return refresh(true);
+						});
+					})
+				]) : ''
 			]) ]);
+
+			items.push([ _('BT 监听端口'), E('span', {}, [ String(btPort) ]) ]);
 
 			items.push([ _('数据目录'), E('span', {}, [
 				E('code', {}, [ st.qb_datadir || '—' ]),
@@ -621,19 +641,27 @@ return view.extend({
 			var running = flag(st.qb_running);
 
 			var fPort = once(inputs.qb, 'port', function() {
-				return textInput(st.qb_port || '8090', '8090');
+				return textInput(st.qb_live_port || st.qb_port || '8090', '8090');
 			});
 			bindOnce(fPort, 'change', function() {
-				saveCfg(sec, { port: fPort.value.trim() || '8090' }).then(function() {
+				var v = fPort.value.trim() || '8090';
+				var bt = (fBt.value || '').trim() || st.qb_live_bt_port || st.qb_bt_port || '21142';
+
+				/* 走 setport：UCI 和 qBittorrent.conf 一起写。
+				   只改 UCI 的话服务没在跑时 conf 还是旧值，页面又会显示回旧端口。 */
+				run(HUB, [ 'setport', v, String(bt) ], _('设置 WebUI 端口')).then(function() {
 					return running ? run(HUB, [ 'restart', 'qbittorrent' ], _('按新端口重启')) : null;
 				});
 			});
 
 			var fBt = once(inputs.qb, 'bt', function() {
-				return textInput(st.qb_bt_port || '21142', '21142');
+				return textInput(st.qb_live_bt_port || st.qb_bt_port || '21142', '21142');
 			});
 			bindOnce(fBt, 'change', function() {
-				saveCfg(sec, { bt_port: fBt.value.trim() || '21142' }).then(function() {
+				var v = fBt.value.trim() || '21142';
+				var web = (fPort.value || '').trim() || st.qb_live_port || st.qb_port || '8090';
+
+				run(HUB, [ 'setport', String(web), v ], _('设置 BT 监听端口')).then(function() {
 					return running ? run(HUB, [ 'restart', 'qbittorrent' ], _('按新端口重启')) : null;
 				});
 			});
@@ -720,7 +748,7 @@ return view.extend({
 				});
 
 				var fHostPort = once(inputs.qb, 'hostport', function() {
-					return textInput(st.qb_host_port || st.qb_port || '8090', '8090');
+					return textInput(st.qb_host_port || st.qb_live_port || st.qb_port || '8090', '8090');
 				});
 				bindOnce(fHostPort, 'change', function() {
 					saveCfg('qbittorrent', { host_port: fHostPort.value.trim() || st.qb_port || '8090' })
@@ -779,7 +807,9 @@ return view.extend({
 
 			if (installed && running)
 				ops.push(openAnchor(_('打开 WebUI'), st.lanip,
-					(st.qb_network || 'host') === 'bridge' ? (st.qb_host_port || st.qb_port) : st.qb_port));
+					(st.qb_network || 'host') === 'bridge'
+						? (st.qb_host_port || st.qb_live_port || st.qb_port)
+						: (st.qb_live_port || st.qb_port)));
 
 			body.push(E('div', { 'class': 'hub-actions', 'style': 'margin-top:1rem' }, ops));
 			body.push(taskBox(st.task));
@@ -1260,11 +1290,62 @@ return view.extend({
 			return E('div', { 'class': 'cbi-section' }, body);
 		}
 
+		/* 已装后的「通用设置」。1Panel 的端口、账号、入口都存在面板自己的
+		 * 数据库里（compose 里的环境变量只在首次初始化时生效），所以这里
+		 * 显示的是从面板实时读到的值，改要去面板里改 —— 给个能填的输入框
+		 * 反而会让人以为改了有效。未安装时安装表单里本来就是这些字段，
+		 * 这里返回空，避免一屏两套同样的表。 */
+		function pnShared(st) {
+			var kind = st.kind || 'none';
+
+			if (kind === 'none')
+				return null;
+
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('通用设置') ]),
+				E('div', { 'class': 'cbi-map-descr' }, [
+					_('下面是从面板数据库里读到的当前值（不是安装时填的那份）。'),
+					E('br'),
+					_('端口、登录账号、入口路径在面板的「面板设置」里改，改完这里会跟着变；'
+						+ '数据目录要动的话得迁移整个目录，风险大，本页只展示。')
+				]),
+				E('div', { 'class': 'hub-form', 'style': 'margin-top:1rem' }, [
+					E('label', {}, [ _('监听端口') ]),
+					E('div', {}, [ E('code', {}, [ st.port || '—' ]),
+						flag(st.listening) ? E('span', { 'class': 'label success' }, [ _('已监听') ])
+							: muted(' ' + _('未监听')) ]),
+
+					E('label', {}, [ _('登录账号') ]),
+					E('div', {}, [ E('code', {}, [ st.username || '—' ]) ]),
+
+					E('label', {}, [ _('入口路径') ]),
+					E('div', {}, [ st.entrance ? E('code', {}, [ st.entrance ]) : muted(_('未设置（直接用 http://IP:端口 访问）')) ]),
+
+					E('label', {}, [ _('访问地址') ]),
+					E('div', {}, [ link(st.address) ]),
+
+					E('label', {}, [ _('数据目录') ]),
+					E('div', {}, [ E('code', {}, [ st.datadir || '—' ]) ]),
+
+					E('label', {}, [ _('镜像 / 程序') ]),
+					E('div', {}, [ kind === 'container'
+						? E('code', {}, [ st.container_image || '—' ])
+						: E('code', {}, [ '/usr/local/bin/1panel（install.sh 安装）' ]) ])
+				])
+			]);
+		}
+
 		function pnView() {
 			var st = state.panel;
 			var frag = E('div');
 
 			frag.appendChild(pnHead(st));
+
+			var shared = pnShared(st);
+
+			if (shared)
+				frag.appendChild(shared);
+
 			frag.appendChild(modeTabs(PN_MODES, state.mode.pn, function(id) {
 				state.mode.pn = id;
 				state.pinned.pn = true;
@@ -1592,7 +1673,8 @@ return view.extend({
 				state.svc, state.mode.qb, state.mode.ol, state.mode.pn, state.mode.wb,
 				h.task, h.docker, h.dockerroot_ok, h.mnt,
 				h.qb_variant, h.qb_running, h.qb_native, h.qb_ct, h.qb_docker_variant,
-				h.qb_port, h.qb_host_port, h.qb_port_busy, h.qb_network, h.qb_datalink,
+				h.qb_port, h.qb_live_port, h.qb_host_port, h.qb_port_busy, h.qb_network, h.qb_datalink,
+				h.qb_bt_port, h.qb_live_bt_port,
 				h.qb_datadir, h.qb_conflict,
 				h.ol_variant, h.ol_running, h.ol_native, h.ol_ct, h.ol_port, h.ol_host_port,
 				h.ol_port_busy, h.ol_network, h.ol_datalink, h.ol_datadir, h.ol_conflict,
@@ -1667,9 +1749,51 @@ return view.extend({
 			});
 		}
 
+		/* 数据目录候选：只是 df，几百毫秒，但不能挡首屏 */
+		function loadDisks() {
+			return Promise.all([
+				call(CTL_1P, [ 'disks' ]).catch(function() { return { text: '' }; }),
+				call(CTL_WB, [ 'disks' ]).catch(function() { return { text: '' }; })
+			]).then(function(res) {
+				state.disks = parseDisks(res[0].text);
+				state.disksWb = parseDisks(res[1].text);
+				drawAll(true);
+			});
+		}
+
+		/* 1Panel 远端最新版本要出网，慢到几秒都可能，单独跑、不 await */
+		function loadLatest() {
+			return call(CTL_1P, [ 'latest' ]).then(function(res) {
+				var v = parseKV(res.text).latest || '';
+
+				if (v && v !== state.latest) {
+					state.latest = v;
+					drawAll(false);
+				}
+			}).catch(function() {});
+		}
+
+		/* 先把页面骨架点出来，别让人对着空白等 status */
+		contentWrap.appendChild(E('div', { 'class': 'cbi-section' }, [
+			E('div', { 'class': 'cbi-map-descr' }, [ _('正在读取状态…') ])
+		]));
+
 		refresh(true);
+		loadDisks();
+		loadLatest();
+
+		/* 任务跑着时 5 秒一轮看进度；空闲时放宽到 10 秒 —— status 里要问
+		   docker、要 df，没必要那么勤。 */
+		var lastPoll = 0;
 
 		poll.add(function() {
+			var now = Date.now();
+
+			if (!busy(parseTask(state.hub.task).phase) && now - lastPoll < 10000)
+				return null;
+
+			lastPoll = now;
+
 			return refresh(false);
 		}, 5);
 

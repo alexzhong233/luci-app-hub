@@ -100,8 +100,19 @@ have_docker() {
 	command -v docker >/dev/null 2>&1
 }
 
+# status 一次执行里会连问好几遍，缓存成一次 docker info。
+DOCKER_LIVE=""
 docker_live() {
-	have_docker && docker info >/dev/null 2>&1
+	[ "$DOCKER_LIVE" = 1 ] && return 0
+	[ "$DOCKER_LIVE" = 0 ] && return 1
+
+	have_docker && docker info >/dev/null 2>&1 || {
+		DOCKER_LIVE=0
+		return 1
+	}
+
+	DOCKER_LIVE=1
+	return 0
 }
 
 # 只输出一行版本号。1pctl 里的命令是 `1panel version`，它把 i18n 前缀也印
@@ -133,7 +144,9 @@ cached_remote_version() {
 remote_version() {
 	local v
 
-	v=$(curl -fsSL --max-time 12 "$BASE_URL/latest" 2>/dev/null | tr -d ' \r\n')
+	# 页面首屏不再调这个（见 main.js），但后台刷新也不能挂太久：
+	# 3 秒连不上就当没网，继续用缓存值。
+	v=$(curl -fsSL --connect-timeout 3 --max-time 6 "$BASE_URL/latest" 2>/dev/null | tr -d ' \r\n')
 	case "$v" in
 		v[0-9]*) echo "$v" ;;
 		*) echo "" ;;
@@ -285,6 +298,50 @@ PROBE_ENT=""
 PROBE_VER=""
 PROBE_USER=""
 
+# 1pctl 是 fork 到容器（或本机）里跑的，一次一两秒；页面每 10 秒轮询一次，
+# 每次都问等于白烧 CPU。结果缓存 15 秒：够页面显示，改完密码也不会太久不刷新。
+PROBE_TTL=15
+
+probe_cache_file() { echo "$TASK_DIR/probe-$1"; }
+
+probe_cache_get() {
+	local f ts v
+
+	f=$(probe_cache_file "$1")
+	[ -s "$f" ] || return 1
+
+	# 安装/升级/重建这类任务期间一律不信缓存，免得刚设的密码、端口被旧值盖住
+	[ "$(task_phase)" = "idle" ] || return 1
+
+	ts=$(sed -n 's/^ts=//p' "$f" | head -n 1)
+	[ -n "$ts" ] || return 1
+	# 时间没同步（1970）时差值巨大，自然走不到缓存，不影响正确性
+	[ $(( $(date +%s) - ts )) -lt "$PROBE_TTL" ] || return 1
+
+	v=$(sed -n 's/^port=//p' "$f" | head -n 1); PROBE_PORT="$v"
+	v=$(sed -n 's/^ent=//p' "$f" | head -n 1); PROBE_ENT="$v"
+	v=$(sed -n 's/^ver=//p' "$f" | head -n 1); PROBE_VER="$v"
+	v=$(sed -n 's/^user=//p' "$f" | head -n 1); PROBE_USER="$v"
+
+	return 0
+}
+
+probe_cache_set() {
+	local f
+
+	f=$(probe_cache_file "$1")
+	mkdir -p "$TASK_DIR"
+	{
+		echo "ts=$(date +%s)"
+		echo "port=$PROBE_PORT"
+		echo "ent=$PROBE_ENT"
+		echo "ver=$PROBE_VER"
+		echo "user=$PROBE_USER"
+	} >"$f.tmp" && mv "$f.tmp" "$f"
+}
+
+probe_cache_drop() { rm -f "$(probe_cache_file "$1")"; }
+
 probe_panel() {
 	local raw line addr ver u
 
@@ -294,17 +351,22 @@ probe_panel() {
 	PROBE_USER=""
 
 	case "$1" in
+		container) ct_running || return 1 ;;
+		native) native_installed || return 1 ;;
+		*) return 1 ;;
+	esac
+
+	probe_cache_get "$1" && return 0
+
+	case "$1" in
 		container)
-			ct_running || return 1
-			raw=$(timeout 15 docker exec "$CT_NAME" sh -c \
+			raw=$(timeout 8 docker exec "$CT_NAME" sh -c \
 				"$BIN_DIR/1pctl version 2>/dev/null; echo @@; $BIN_DIR/1pctl user-info 2>/dev/null" 2>/dev/null)
 			;;
 		native)
-			native_installed || return 1
-			raw=$(timeout 15 sh -c \
+			raw=$(timeout 8 sh -c \
 				"$BIN_DIR/1pctl version 2>/dev/null; echo @@; $BIN_DIR/1pctl user-info 2>/dev/null" 2>/dev/null)
 			;;
-		*) return 1 ;;
 	esac
 
 	[ -n "$raw" ] || return 1
@@ -329,6 +391,8 @@ probe_panel() {
 		PROBE_ENT=${addr#* }
 		PROBE_ENT=${PROBE_ENT%/}
 	fi
+
+	probe_cache_set "$1"
 	return 0
 }
 
@@ -1039,6 +1103,7 @@ case "${1:-}" in
 	update) cmd_update ;;
 	start | stop | restart)
 		native_installed || { echo "本地版 1Panel 未安装" >&2; exit 1; }
+		probe_cache_drop native
 		[ -x "$INIT_DIR/1panel-core" ] && "$INIT_DIR/1panel-core" "$1" 2>&1
 		[ -x "$INIT_DIR/1panel-agent" ] && "$INIT_DIR/1panel-agent" "$1" 2>&1
 		;;
@@ -1048,8 +1113,8 @@ case "${1:-}" in
 		case "${2:-}" in
 			install) shift 2; cmd_ct_install "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" ;;
 			update) cmd_ct_update ;;
-			start | stop | restart) cmd_ct_lifecycle "$2" ;;
-			remove) cmd_ct_remove "${3:-}" ;;
+			start | stop | restart) probe_cache_drop container; cmd_ct_lifecycle "$2" ;;
+			remove) probe_cache_drop container; cmd_ct_remove "${3:-}" ;;
 			logs) cmd_ct_logs ;;
 			*) echo "用法：1panel-ctl container install|update|start|stop|restart|remove [purge]|logs" >&2; exit 1 ;;
 		esac

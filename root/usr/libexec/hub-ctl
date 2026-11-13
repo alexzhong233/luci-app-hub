@@ -70,18 +70,40 @@ arch_name() {
 	esac
 }
 
+# 页面上的访问地址一律用 LAN 地址。
+# 不能用「默认路由那个接口的地址」—— 那是 WAN 口（光猫给路由器分的 192.168.1.x），
+# 和 1panel-ctl / workbuddy2api-ctl 的算法不一致，页面上会出现两套 IP。
 lan_ip() {
-	local dev
-	dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
-	[ -n "$dev" ] || return 0
-	ip -4 addr show "$dev" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1
+	local ip
+
+	ip=$(uci -q get network.lan.ipaddr)
+	ip=${ip%%/*}
+
+	if [ -z "$ip" ]; then
+		ip=$(ip -4 addr show br-lan 2>/dev/null |
+			awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+	fi
+
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr)
+	echo "${ip:-192.168.1.1}"
 }
 
 have_docker() { command -v docker >/dev/null 2>&1; }
 
+# status 一次执行里会问好几遍「docker 在不在」，每次 docker info 都要
+# 连一次 socket，在 OpenWrt 上是实打实的几十毫秒，缓存下来只问一次。
+DOCKER_LIVE=""
 docker_live() {
-	have_docker || return 1
-	docker info >/dev/null 2>&1
+	[ -n "$DOCKER_LIVE" ] && [ "$DOCKER_LIVE" = 1 ] && return 0
+	[ "$DOCKER_LIVE" = 0 ] && return 1
+
+	have_docker && docker info >/dev/null 2>&1 || {
+		DOCKER_LIVE=0
+		return 1
+	}
+
+	DOCKER_LIVE=1
+	return 0
 }
 
 # /proc/net/tcp 的本地地址形如 0100007F:1F90，端口是冒号后的 4 位十六进制。
@@ -264,6 +286,41 @@ qb_image() {
 	docker-ee) cfg_def qbittorrent.image "$QBT_IMG_EE" ;;
 	*) cfg_def qbittorrent.image "$QBT_IMG_STD" ;;
 	esac
+}
+
+# conf 里真正生效的端口。
+#
+# UCI 里的 port 只是「下次启动要写进去的目标值」：用户完全可能直接在 qB 自己的
+# WebUI 里改端口，那时 conf 才是事实。页面上要显示、要拿来拼访问地址的，
+# 必须是这个实际在听的值，否则就会出现「设置里写 8090、其实在听 9091」。
+qb_conf_file() { echo "$(qb_datadir)/config/qBittorrent.conf"; }
+
+# $1 形如 WebUI\Port / Session\Port —— 用 awk 按整键名比较，反斜杠是普通字符。
+# 注意：不能用 `awk -v k=...`，awk 的 -v 会解释转义，`\P` 会被吞成 `P`
+# 导致永远匹配不上；走 ENVIRON 传参不做转义。
+qb_conf_port() {
+	local f v
+
+	f=$(qb_conf_file)
+	[ -f "$f" ] || return 0
+
+	v=$(K="$1" awk -F= '$1 == ENVIRON["K"] { print $2; exit }' "$f" 2>/dev/null | tr -d '\r')
+	case "$v" in
+	'' | *[!0-9]*) return 0 ;;
+	esac
+	echo "$v"
+}
+
+qb_live_port() {
+	local p
+	p=$(qb_conf_port 'WebUI\Port')
+	echo "${p:-$(qb_port)}"
+}
+
+qb_live_bt_port() {
+	local p
+	p=$(qb_conf_port 'Session\Port')
+	echo "${p:-$(qb_bt_port)}"
 }
 
 # 原生版装的是哪一个：std / ee / 空
@@ -499,23 +556,16 @@ qb_worker_install() {
 	echo "== 完成"
 }
 
-# 把 hub 里配的端口写进各包自己的配置。
-# hub 的 UCI 是 hub 的，qB 和 OpenList 的 init 读的是它们自己的段，
-# 不同步的话页面上改端口只是改了个没人看的数字。
-qb_sync_port() {
+# 直接改 qBittorrent.conf 里的两个端口。conf 不存在（还没装）就什么都不做。
+qb_write_conf_port() {
 	local conf port bt
 
-	# qB 原生版：init 每次启动都会用 qbittorrent.config.http_port 覆盖 conf
-	if uci -q get qbittorrent.config >/dev/null 2>&1; then
-		uci -q set "qbittorrent.config.http_port=$(qb_port)"
-		uci -q commit qbittorrent
-	fi
-
-	# BT 监听端口不在 UCI 里，只能改 conf 的 Session\Port
-	conf="$(qb_datadir)/config/qBittorrent.conf"
+	conf=$(qb_conf_file)
 	[ -f "$conf" ] || return 0
-	port=$(qb_port)
-	bt=$(qb_bt_port)
+
+	port="$1"
+	bt="$2"
+
 	awk -v p="$port" -v b="$bt" '
 		/^WebUI\\Port=/   { print "WebUI\\Port=" p; next }
 		/^Session\\Port=/ { print "Session\\Port=" b; next }
@@ -525,6 +575,21 @@ qb_sync_port() {
 		return 0
 	}
 	mv -f "$conf.hubnew" "$conf"
+	return 0
+}
+
+# 把 hub 里配的端口写进各包自己的配置。
+# hub 的 UCI 是 hub 的，qB 和 OpenList 的 init 读的是它们自己的段，
+# 不同步的话页面上改端口只是改了个没人看的数字。
+qb_sync_port() {
+	# qB 原生版：init 每次启动都会用 qbittorrent.config.http_port 覆盖 conf
+	if uci -q get qbittorrent.config >/dev/null 2>&1; then
+		uci -q set "qbittorrent.config.http_port=$(qb_port)"
+		uci -q commit qbittorrent
+	fi
+
+	# BT 监听端口不在 UCI 里，只能改 conf 的 Session\Port
+	qb_write_conf_port "$(qb_port)" "$(qb_bt_port)"
 	return 0
 }
 
@@ -679,7 +744,7 @@ qb_status() {
 	cstate=$(ct_state "$QBT_CT" 2>/dev/null)
 	running=0
 	listen=0
-	port_listening "$(qb_port)" && listen=1
+	port_listening "$(qb_live_port)" && listen=1
 
 	case "$v" in
 	docker | docker-ee) [ "$cstate" = "running" ] && running=1 ;;
@@ -693,9 +758,11 @@ qb_status() {
 	echo "qb_docker_variant=$(cat "$(qb_datadir)/.docker-variant" 2>/dev/null)"
 	echo "qb_running=$running"
 	echo "qb_port=$(qb_port)"
+	echo "qb_live_port=$(qb_live_port)"
 	echo "qb_host_port=$(qb_host_port)"
 	echo "qb_port_busy=$listen"
 	echo "qb_bt_port=$(qb_bt_port)"
+	echo "qb_live_bt_port=$(qb_live_bt_port)"
 	echo "qb_network=$(qb_net)"
 	echo "qb_datadir=$(qb_datadir)"
 	echo "qb_config=$(qb_datadir)/config"
@@ -1063,6 +1130,40 @@ cmd_install() {
 	esac
 }
 
+# 把端口存成「设置值」：hub 的 UCI + 包自己的 UCI + qBittorrent.conf。
+# 页面上「实际在听 8091、设置里是 8090」时，一键把这个值转正。
+cmd_setport() {
+	local port bt
+
+	port="${1:-}"
+	bt="${2:-}"
+
+	case "$port" in
+	'' | *[!0-9]*)
+		echo "用法：hub-ctl setport <WebUI 端口> [BT 端口]" >&2
+		return 1
+		;;
+	esac
+
+	case "$bt" in
+	'') bt=$(qb_bt_port) ;;
+	*[!0-9]*)
+		echo "BT 端口必须是数字" >&2
+		return 1
+		;;
+	esac
+
+	save_cfg qbittorrent "port=$port" "bt_port=$bt"
+
+	if uci -q get qbittorrent.config >/dev/null 2>&1; then
+		uci -q set "qbittorrent.config.http_port=$port"
+		uci -q commit qbittorrent
+	fi
+
+	qb_write_conf_port "$port" "$bt"
+	echo "== 已设为 WebUI $port / BT $bt"
+}
+
 cmd_lifecycle() {
 	local svc="$1" act="$2"
 	case "$svc:$act" in
@@ -1169,6 +1270,7 @@ esac
 
 case "$1" in
 status) shift; cmd_status ;;
+setport) shift; cmd_setport "$@" ;;
 install) shift; cmd_install "$@" ;;
 start | stop | restart) cmd_lifecycle "$2" "$1" ;;
 remove) shift; cmd_remove "$@" ;;
@@ -1192,6 +1294,7 @@ task) cmd_task ;;
   status                          输出所有服务的状态（key=value）
   install <qbittorrent|openlist> [变体]  按指定（或当前）变体安装（后台任务）
   start|stop|restart <svc>        启停
+  setport <WebUI端口> [BT端口]     把端口存成设置值（写 UCI + qBittorrent.conf）
   remove <svc>                    卸载（保留数据目录）
   logs <svc> [行数]               日志
   passwd <svc> <新密码>           设置 WebUI / 管理员密码

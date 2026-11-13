@@ -80,8 +80,19 @@ have_docker() {
 	command -v docker >/dev/null 2>&1
 }
 
+# status 一次执行里会连问好几遍，缓存成一次 docker info。
+DOCKER_LIVE=""
 docker_live() {
-	have_docker && docker info >/dev/null 2>&1
+	[ "$DOCKER_LIVE" = 1 ] && return 0
+	[ "$DOCKER_LIVE" = 0 ] && return 1
+
+	have_docker && docker info >/dev/null 2>&1 || {
+		DOCKER_LIVE=0
+		return 1
+	}
+
+	DOCKER_LIVE=1
+	return 0
 }
 
 pkg_mgr() {
