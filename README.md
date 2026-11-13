@@ -11,9 +11,20 @@
 
 四个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
 
-版式沿用 `luci-app-1panel` 与 `luci-app-workbuddy2api` 原来那套：顶部是两列的状态卡，
-下面是两列网格表单，再下面一排动作按钮，最底下是命令输出。用 CSS Grid 而不是
-`<table>` / `cbi-value`，是因为 Argon、Aurora 这类主题对 `th`/`td` 和
+版式沿用 `luci-app-1panel` 与 `luci-app-workbuddy2api` 原来那套。每个服务都是同一结构：
+
+```
+状态卡（两列 hub-grid）
+通用设置（两列 hub-form：端口 / 数据目录 / 密码）
+方式页签（hub-tabs，当前方式高亮，已装的打「（已装）」）
+安装 / 操作区（未装是安装表单，已装是启动/停止/重启/日志/卸载）
+输出（pre，命令原文与返回）
+```
+
+**运行方式一律用页签，不用下拉框**：qBittorrent 4 个、OpenList 3 个、1Panel 2 个、
+WorkBuddy2API 4 个。通用设置常驻，装完也不消失，改端口、改数据目录随时可以。
+
+用 CSS Grid 而不是 `<table>` / `cbi-value`，是因为 Argon、Aurora 这类主题对 `th`/`td` 和
 `.cbi-value-title` 有高特异性的 `!important` 规则，会把表头和数据行拆成不同的盒模型，
 HTML 表格在这种主题下必然错位。
 
@@ -69,6 +80,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/alexzhong233/luci-app-hub@main/deploy.sh 
 ```sh
 /usr/libexec/hub-ctl status                    # key=value 形式的状态
 /usr/libexec/hub-ctl install qbittorrent       # 按当前 variant 安装（后台任务）
+/usr/libexec/hub-ctl install qbittorrent docker-ee   # 指定变体，页面就是走这条
 /usr/libexec/hub-ctl start|stop|restart qbittorrent|openlist
 /usr/libexec/hub-ctl logs qbittorrent 40
 /usr/libexec/hub-ctl remove openlist           # 卸载，数据目录保留

@@ -484,9 +484,15 @@ qb_worker_install() {
 		;;
 	esac
 
-	# 把变体写进 uci，下次打开页面能对上
 	# 装完再链一次：包管理器可能把原生目录又建成了实体目录
 	link_datadir qbittorrent /etc/qBittorrent >/dev/null 2>&1
+
+	# 容器版两个变体共用同一个容器名，光看容器状态分不出装的是哪个，
+	# 所以在数据目录里留个标记，页面据此给对应的页签打「已装」。
+	case "$v" in
+	docker | docker-ee) echo "$v" >"$(qb_datadir)/.docker-variant" 2>/dev/null ;;
+	*) rm -f "$(qb_datadir)/.docker-variant" 2>/dev/null ;;
+	esac
 
 	save_cfg qbittorrent "variant=$v"
 	set_phase "done"
@@ -684,6 +690,7 @@ qb_status() {
 	echo "qb_native=$kind"
 	echo "qb_image=$img"
 	echo "qb_ct=$cstate"
+	echo "qb_docker_variant=$(cat "$(qb_datadir)/.docker-variant" 2>/dev/null)"
 	echo "qb_running=$running"
 	echo "qb_port=$(qb_port)"
 	echo "qb_host_port=$(qb_host_port)"
@@ -1023,12 +1030,34 @@ cmd_status() {
 }
 
 cmd_install() {
-	local svc="$1"
+	local svc="$1" v="$2"
 	case "$svc" in
-	qbittorrent) spawn_task "installing:$(qb_variant)" "安装 qBittorrent" _worker_qb_install ;;
-	openlist) spawn_task "installing:$(ol_variant)" "安装 OpenList" _worker_ol_install ;;
+	qbittorrent)
+		# 页面按页签选运行方式，所以允许直接带变体过来：装之前先落到 UCI，
+		# 后面的 worker 与 start 都读同一个值，不会出现「装了 A 跑了 B」。
+		case "$v" in
+		luci | luci-ee | docker | docker-ee) save_cfg qbittorrent "variant=$v" ;;
+		"") ;;
+		*)
+			echo "用法：hub-ctl install qbittorrent [luci|luci-ee|docker|docker-ee]" >&2
+			return 1
+			;;
+		esac
+		spawn_task "installing:$(qb_variant)" "安装 qBittorrent" _worker_qb_install
+		;;
+	openlist)
+		case "$v" in
+		openlist2 | feeds | docker) save_cfg openlist "variant=$v" ;;
+		"") ;;
+		*)
+			echo "用法：hub-ctl install openlist [openlist2|feeds|docker]" >&2
+			return 1
+			;;
+		esac
+		spawn_task "installing:$(ol_variant)" "安装 OpenList" _worker_ol_install
+		;;
 	*)
-		echo "用法：hub-ctl install qbittorrent|openlist" >&2
+		echo "用法：hub-ctl install qbittorrent|openlist [变体]" >&2
 		return 1
 		;;
 	esac
@@ -1073,6 +1102,7 @@ cmd_remove() {
 		std) pkg_del qbittorrent ;;
 		esac
 		docker rmi "$(qb_image)" >/dev/null 2>&1
+		rm -f "$(qb_datadir)/.docker-variant" 2>/dev/null
 		;;
 	openlist)
 		ol_stop_all
@@ -1160,7 +1190,7 @@ task) cmd_task ;;
 用法：hub-ctl <命令>
 
   status                          输出所有服务的状态（key=value）
-  install <qbittorrent|openlist>  按当前 variant 安装（后台任务）
+  install <qbittorrent|openlist> [变体]  按指定（或当前）变体安装（后台任务）
   start|stop|restart <svc>        启停
   remove <svc>                    卸载（保留数据目录）
   logs <svc> [行数]               日志
