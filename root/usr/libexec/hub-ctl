@@ -502,6 +502,98 @@ ol_compose_write() {
 	return 0
 }
 
+# ---------------------------------------------------------------- openlist2 运行时安装
+# openlist2 不在官方 apk 源里（sbwml 的第三方仓库），但作者给每个架构都出了
+# 预编译包：releases/latest/download/openwrt-<sdk>-<arch>.tar.gz，解开就是
+# packages_ci/ 下的三个包（openlist2、luci-app-openlist2、中文翻译）。
+# 所以运行时不用编译，下载解包后本地安装 —— 和作者自己的 install.sh 一个路子。
+#
+# 为什么不用源码：openlist2 本体是 Go 程序，路由器上没法编译，那个仓库里也
+# 只有 Makefile（编译时从 OpenList 源码构建），没有现成二进制。
+ol2_arch() {
+	local a
+	a=$(grep -m1 '^DISTRIB_ARCH=' /etc/openwrt_release 2>/dev/null |
+		sed 's/^DISTRIB_ARCH=//' | tr -d '"' | tr -d "'")
+	[ -n "$a" ] || a=$(uname -m)
+	echo "$a"
+}
+
+ol2_sdk() {
+	case "$(pkg_mgr)" in
+	apk) echo "openwrt-25.12" ;;
+	opkg) echo "openwrt-24.10" ;;
+	*) return 1 ;;
+	esac
+}
+
+# 下载并本地安装 openlist2 三件套。直连失败自动换 gh-proxy.com 镜像。
+ol2_fetch() {
+	local arch sdk file base tmp url ok="" pkg found="" rc
+
+	arch=$(ol2_arch)
+	sdk=$(ol2_sdk) || {
+		echo "!! 没有可用的包管理器（apk / opkg 都不在）" >&2
+		return 1
+	}
+	file="$sdk-$arch.tar.gz"
+	base="https://github.com/sbwml/luci-app-openlist2/releases/latest/download/$file"
+
+	tmp=$(mktemp -d) || return 1
+	for url in "$base" "https://gh-proxy.com/$base"; do
+		echo "-- 下载 $url"
+		if curl -fsSL --connect-timeout 10 --retry 2 -m 600 -o "$tmp/$file" "$url"; then
+			ok=1
+			break
+		fi
+		echo "   失败，换下一个地址"
+	done
+	if [ -z "$ok" ]; then
+		echo "!! 下载失败：$file（架构 $arch，SDK $sdk）" >&2
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	tar -xzf "$tmp/$file" -C "$tmp" || {
+		echo "!! 解压失败" >&2
+		rm -rf "$tmp"
+		return 1
+	}
+
+	# apk 与 ipk 两种后缀都收，版本号变化不影响匹配
+	# shellcheck disable=SC2086
+	for pkg in "$tmp"/packages_ci/openlist2-*.apk \
+	           "$tmp"/packages_ci/luci-app-openlist2-*.apk \
+	           "$tmp"/packages_ci/luci-i18n-openlist2-*.apk \
+	           "$tmp"/packages_ci/openlist2_*.ipk \
+	           "$tmp"/packages_ci/luci-app-openlist2_*.ipk \
+	           "$tmp"/packages_ci/luci-i18n-openlist2-*.ipk; do
+		[ -f "$pkg" ] && found="$found $pkg"
+	done
+	if [ -z "$found" ]; then
+		echo "!! 压缩包里没有预期的包（目录结构变了？）" >&2
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	echo "-- 安装：$(printf '%s\n' $found | sed 's#.*/##' | tr '\n' ' ')"
+	case "$(pkg_mgr)" in
+	# 这些包是作者自签的，不在本机信任链里
+	apk) apk add --allow-untrusted $found ;;
+	opkg) opkg install --force-downgrade $found ;;
+	esac
+	rc=$?
+
+	# 重装同一个版本时 apk 可能返回非 0（already installed），
+	# 只要包在系统里就算成功。
+	if [ "$rc" -ne 0 ] && pkg_installed openlist2; then
+		echo "-- 已安装同版本，跳过"
+		rc=0
+	fi
+
+	rm -rf "$tmp"
+	return $rc
+}
+
 ol_stop_all() {
 	local k
 	k=$(ol_native_kind)
@@ -527,11 +619,11 @@ ol_worker_install() {
 		}
 		;;
 	openlist2)
-		echo "== openlist2（sbwml）"
+		echo "== openlist2（sbwml 预编译包）"
 		ol_stop_all
 		pkg_installed openlist && pkg_del openlist
-		pkg_add luci-app-openlist2 || {
-			set_phase "error:安装 luci-app-openlist2 失败"
+		ol2_fetch || {
+			set_phase "error:安装 openlist2 失败（下载或本地安装出错）"
 			return 1
 		}
 		;;
@@ -679,7 +771,7 @@ cmd_remove() {
 		fi
 		kind=$(ol_native_kind)
 		case "$kind" in
-		openlist2) pkg_del luci-app-openlist2 ;;
+		openlist2) pkg_del luci-app-openlist2 openlist2 luci-i18n-openlist2-zh-cn ;;
 		feeds) pkg_del openlist ;;
 		esac
 		docker rmi "$(ol_image)" >/dev/null 2>&1

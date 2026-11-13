@@ -5,7 +5,7 @@
 | 页签 | 运行方式 |
 |---|---|
 | **qBittorrent** | 原生官方版 · 原生增强版（EE，反吸血） · 容器官方版 · 容器增强版 |
-| **OpenList** | openlist2（sbwml） · feeds 官方版 · 容器版 |
+| **OpenList** | openlist2（sbwml，运行时下载预编译包） · feeds 官方版 · 容器版 |
 | **1Panel** | 容器版 · 本地版 |
 | **WorkBuddy2API** | 本地 Rust · 本地 Python · 容器 Rust · 容器 Python |
 
@@ -72,6 +72,26 @@ curl -fsSL https://cdn.jsdelivr.net/gh/alexzhong233/luci-app-hub@main/deploy.sh 
 /usr/libexec/hub-ctl logs qbittorrent 40
 /usr/libexec/hub-ctl remove openlist           # 卸载，数据目录保留
 ```
+
+## openlist2 是怎么装的
+
+固件不带 openlist2，它的源码仓库里也没有现成二进制（`Makefile` 是编译期从
+OpenList 源码构建的 Go 程序）。但作者给每个架构都出了预编译包：
+
+```
+https://github.com/sbwml/luci-app-openlist2/releases/latest/download/openwrt-<sdk>-<arch>.tar.gz
+```
+
+解开就是 `packages_ci/` 下三个包（`openlist2`、`luci-app-openlist2`、中文翻译），
+总共约 22 MB。`hub-ctl` 的 `ol2_fetch()` 做三件事：
+
+1. 从 `/etc/openwrt_release` 读 `DISTRIB_ARCH`，按包管理器定 SDK
+   （有 `apk` → `openwrt-25.12`，有 `opkg` → `openwrt-24.10`）
+2. 下载，直连失败自动换 `gh-proxy.com` 镜像
+3. `apk add --allow-untrusted` / `opkg install --force-downgrade` 本地装那三个包
+
+所以页面上「原生 · openlist2」这个选项**不需要固件预装、也不需要源里有这个包**，
+点安装就会现下载。卸载时三个包一起删，`/etc/openlist2` 的数据保留。
 
 ## 已知问题
 

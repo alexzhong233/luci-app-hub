@@ -287,7 +287,7 @@ return view.extend({
 
 			return E('div', {}, [
 				row('运行方式', selectBox(cur, [
-					{ value: 'openlist2', label: '原生 · openlist2（sbwml，带 LuCI 页面）' },
+					{ value: 'openlist2', label: '原生 · openlist2（sbwml，带 LuCI 页面，运行时下载）' },
 					{ value: 'feeds', label: '原生 · feeds 官方 openlist' },
 					{ value: 'docker', label: '容器 · openlistteam/openlist' }
 				], function(v) {
