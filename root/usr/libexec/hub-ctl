@@ -103,6 +103,13 @@ ct_present() { [ -n "$(ct_state "$1")" ]; }
 
 ct_running() { [ "$(ct_state "$1")" = "running" ]; }
 
+# 容器镜像存在哪。落在 /mnt 上刷机不受影响，落在 overlay 上既吃空间、
+# 又会在 sysupgrade 后一起没掉（overlay 被清空）。
+docker_root() {
+	docker_live || return 0
+	docker info --format '{{.DockerRootDir}}' 2>/dev/null
+}
+
 compose_bin() {
 	if docker_live && docker compose version >/dev/null 2>&1; then
 		echo "docker compose"
@@ -984,6 +991,14 @@ cmd_status() {
 	echo "mnt=$(is_mnt_ok && echo 1 || echo 0)"
 	echo "dataroot=$(data_root)"
 	echo "lanip=$(lan_ip)"
+
+	# 容器版要不要提醒「镜像在 overlay 上」，页面据此显示警告
+	dr=$(docker_root)
+	echo "dockerroot=$dr"
+	case "$dr" in
+	/mnt/*) echo "dockerroot_ok=1" ;;
+	*) echo "dockerroot_ok=0" ;;
+	esac
 	qb_status
 	ol_status
 }

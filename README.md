@@ -102,6 +102,42 @@ base-files 默认保留的 `/etc/config/` 里，也留得住。
 然后把目录换成链接。装包前会先摘掉链接，避免 apk 解包时把初始 `data.db`
 写穿到真实库上。
 
+### 刷机之后
+
+**数据不丢，程序要重装一次。**
+
+原生版（qB / openlist2 / feeds openlist）是 `apk add` 装到 overlay 上的，
+sysupgrade 会清空 overlay —— 包没了。但 `/mnt/sda1` 上的数据原封不动，
+`/etc/config/hub` 里的运行方式和端口也都留着（`/etc/config/` 默认保留）。
+
+刷完打开页面，运行方式还是你上次选的那个，点一下「安装」就回来了：
+
+- 原生版：重新下载 37 MB（qB + Qt6）或 22 MB（openlist2），然后 `link_datadir`
+  自动把 `/etc/qBittorrent` 链回 `/mnt` —— 配置、种子、`.fastresume` 立刻就位
+- 容器版：`docker compose up -d` 重建容器。**前提是 Docker 的 data-root 在
+  `/mnt` 上**，那样镜像还留着，秒起；如果 data-root 在 overlay（默认
+  `/var/lib/docker`），镜像也会没，得重新 pull
+
+页面会在 Docker 数据目录不在 `/mnt` 时给出提示。改成 `/mnt` 是一次性的：
+
+```sh
+uci set dockerd.globals.data_root='/mnt/sda1/docker'
+uci commit dockerd
+/etc/init.d/dockerd restart
+```
+
+`dockerd` 的 init 读的是 `config globals` 段的 `data_root`（默认 `/opt/docker/`，
+就在 overlay 上），然后生成 `/etc/docker/daemon.json` 的 `data-root`。改完
+`docker info | grep 'Docker Root Dir'` 确认。
+
+改完要重新 pull 一次镜像（旧镜像在 overlay 上，不会自动搬），但从那以后
+容器版和 1Panel 的镜像都能跨刷机保留。
+
+**为什么不把包塞进 keep.d**：sysupgrade 保留的是文件，但 `/usr/bin/qbittorrent-nox`
+加上 Qt6 那套库有 30 多 MB，打进备份包既慢又容易在恢复时出问题；而且 OpenWrt
+的包管理器状态（`/lib/apk`）不在保留集里，恢复出来的文件是"孤儿包"，以后
+`apk del` 都删不掉。点一次按钮比这干净。
+
 ### 卸载
 
 `remove` 只删包和容器，不动 datadir。页面上会显示数据目录的实际路径。

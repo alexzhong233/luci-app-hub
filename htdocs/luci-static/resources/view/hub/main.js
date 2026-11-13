@@ -314,7 +314,8 @@ return view.extend({
 						: '  · 仅在 /etc 上（sda1 不可用）'),
 					note('配置在 ' + (st.qb_config || '') +
 						'，含 qBittorrent.conf 与 BT_backup（种子与做种记录），别丢。' +
-						'优先用 /mnt/sda1/Configs/services，安装时会自动把 /etc/qBittorrent 迁过去并换成链接。')
+						'优先用 /mnt/sda1/Configs/services，安装时会自动把 /etc/qBittorrent 迁过去并换成链接。' +
+						'这里的配置和种子跨刷机保留；原生版的程序本身装在 overlay 上，刷完要点一次「安装」恢复。')
 				])),
 
 				row('容器网络', selectBox(st.qb_network || 'host', [
@@ -323,6 +324,11 @@ return view.extend({
 				], function(v) {
 					return saveCfg(sec, { network: v });
 				})),
+
+				flag(st.docker) && !flag(st.dockerroot_ok)
+					? note('⚠ Docker 数据目录在 ' + (st.dockerroot || 'overlay') +
+						'，镜像会吃 overlay 空间，刷机后还会一起没掉。改到 /mnt 后容器版才能跨刷机保留（镜像不用重下）。')
+					: null,
 
 				row('WebUI 密码', E('div', {}, [
 					passBox('新密码，留空不改', function(v) {
@@ -382,7 +388,8 @@ return view.extend({
 						: '  · 仅在 /etc 上（sda1 不可用）'),
 					note('config.json 与 data.db 都在这里。' +
 						'/etc/openlist2 与 /etc/openlist 会被链接到同一位置，' +
-						'容器版挂载的也是这里（容器内 /opt/openlist/data）。')
+						'容器版挂载的也是这里（容器内 /opt/openlist/data）。' +
+						'数据跨刷机保留；原生版的程序在 overlay 上，刷完要点一次「安装」。')
 				])),
 
 				row('容器网络', selectBox(st.ol_network || 'host', [
@@ -391,6 +398,11 @@ return view.extend({
 				], function(v) {
 					return saveCfg(sec, { network: v });
 				})),
+
+				flag(st.docker) && !flag(st.dockerroot_ok)
+					? note('⚠ Docker 数据目录在 ' + (st.dockerroot || 'overlay') +
+						'，镜像会吃 overlay 空间，刷机后还会一起没掉。改到 /mnt 后容器版才能跨刷机保留。')
+					: null,
 
 				row('管理员密码', E('div', {}, [
 					passBox('新密码，留空不改', function(v) {
