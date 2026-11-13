@@ -24,7 +24,7 @@ SELF=$(readlink -f "$0" 2>/dev/null || echo /usr/libexec/hub-ctl)
 TASK_DIR="/var/run/hub-task"
 
 QBT_IMG_STD="lscr.io/linuxserver/qbittorrent:latest"
-QBT_IMG_EE="p3terx/qbittorrent-enhanced:latest"
+QBT_IMG_EE="superng6/qbittorrentee:latest"
 OL_IMG="openlistteam/openlist:latest"
 
 QBT_CT="qbittorrent"
@@ -386,13 +386,14 @@ qb_compose_write() {
 	img=$(qb_image)
 	dl=$(qb_downloads)
 
-	# 两个镜像的约定完全不一样，不能共用一份 compose：
-	#   linuxserver（官方版）  配置挂 /config，端口走 WEBUI_PORT / TORRENTING_PORT
-	#   p3terx（增强版）       配置挂 /qBittorrent，端口走 QBT_WEBUI_PORT，
-	#                          默认值是 28080 —— 不传就一直是 28080
-	# 巧的是两边的 conf 最终都落在 <dir>/config/qBittorrent.conf，页面读的是同一个文件。
+	# 每个镜像的约定都不一样，不能共用一份 compose：
+	#   linuxserver（官方版）  挂 /config，端口 WEBUI_PORT / TORRENTING_PORT
+	#   superng6（增强版）     挂 /config，端口 WEBUIPORT（没有下划线）
+	# 两边的 conf 都落在 <dir>/config/qBittorrent.conf，页面读的是同一个文件。
+	# p3terx 那版虽然也叫增强版，但停更在 4.4，早就不用了，分支留着是防有人手改镜像名。
 	case "$img" in
 	*p3terx*) kind=p3terx ;;
+	*superng6*) kind=superng6 ;;
 	*) kind=lsio ;;
 	esac
 
@@ -424,14 +425,22 @@ qb_compose_write() {
 		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
 		echo "      PUID: '0'"
 		echo "      PGID: '0'"
-		if [ "$kind" = p3terx ]; then
+		case "$kind" in
+		p3terx)
 			echo "      UMASK_SET: '022'"
 			echo "      QBT_WEBUI_PORT: $(yaml_q "$port")"
-		else
+			;;
+		superng6)
+			echo "      UMASK: '022'"
+			echo "      WEBUIPORT: $(yaml_q "$port")"
+			echo "      ENABLE_DOWNLOADS_PERM_FIX: 'true'"
+			;;
+		*)
 			echo "      UMASK: '022'"
 			echo "      WEBUI_PORT: $(yaml_q "$port")"
 			echo "      TORRENTING_PORT: $(yaml_q "$bt")"
-		fi
+			;;
+		esac
 		echo "    volumes:"
 		if [ "$kind" = p3terx ]; then
 			# p3terx 把 /qBittorrent 当 profile 根，整个数据目录挂进去

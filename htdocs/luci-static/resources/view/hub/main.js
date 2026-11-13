@@ -65,9 +65,10 @@ var QB_MODES = [
 	{
 		id: 'docker-ee',
 		title: _('容器·增强版'),
-		how: _('docker compose 起 p3terx/qbittorrent-enhanced'),
+		how: _('docker compose 起 superng6/qbittorrentee（跟到 5.x，约 100MB）'),
 		notes: [
 			_('容器版的增强版，反吸血在 WebUI 的「连接」设置里。'),
+			_('配置挂 <数据目录>/config，和官方版同一个位置，互切不丢种子。'),
 			_('同样把配置与种子写在数据目录的 config/ 下。'),
 			_('与容器·官方版共用同一个容器名，装这个会替换掉那个。')
 		]
