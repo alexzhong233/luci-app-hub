@@ -839,11 +839,19 @@ ol_set_password() {
 
 	case "$v" in
 	docker)
+		# 安装流程里刚 up -d 完，容器可能还在 starting，等一会儿再 exec
+		i=0
+		while [ "$i" -lt 20 ]; do
+			ct_running "$OL_CT" && break
+			sleep 1
+			i=$((i + 1))
+		done
 		ct_running "$OL_CT" || {
 			echo "!! 容器没在跑，先把 OpenList 启动起来" >&2
 			return 1
 		}
-		docker exec "$OL_CT" ./openlist admin set "$pass"
+		# 用绝对路径：容器的默认工作目录不一定是 /opt/openlist
+		docker exec "$OL_CT" /opt/openlist/openlist admin set "$pass"
 		;;
 	*)
 		# 原生版正在跑的话，活库在 /etc/openlist2 或 /etc/openlist，
@@ -1017,8 +1025,18 @@ ol_compose_write() {
 		echo "    volumes:"
 		# 官方镜像的数据目录是 /opt/openlist/data，config.json 与 data.db 都在里面
 		echo "      - $(yaml_q "$dir:/opt/openlist/data")"
-		# 网盘挂载的本地目录：整机 /mnt 只读挂进去，面板里选存储路径时能看到
-		echo "      - $(yaml_q "/mnt:/mnt:rslave")"
+		# 网盘挂载的本地目录：把 /mnt 下真实的挂载点逐个 bind 进去。
+		# 不能写 /mnt:/mnt:rslave —— OpenWrt 上 /mnt 通常不是独立挂载点，
+		# 父挂载（/）的传播属性又是 private，docker 会直接拒绝：
+		#   path /mnt is mounted on / but it is not a shared or slave mount
+		mnt_n=0
+		for d in /mnt/*; do
+			[ -d "$d" ] || continue
+			mountpoint -q "$d" 2>/dev/null || continue
+			echo "      - $(yaml_q "$d:$d")"
+			mnt_n=$((mnt_n + 1))
+		done
+		[ "$mnt_n" = 0 ] && echo "      - $(yaml_q "/mnt:/mnt")"
 		case "$net" in
 		host | bridge) ;;
 		*)

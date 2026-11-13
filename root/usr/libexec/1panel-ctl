@@ -244,14 +244,21 @@ yaml_q() {
 }
 
 compose_write() {
-	local f="$1" root="$2" tz mnt_opt
+	local f="$1" root="$2" tz mnt_vols d
 
 	tz=$(uci -q get system.@system[0].zonename)
 	[ -n "$tz" ] || tz="Asia/Shanghai"
 
-	# /mnt 是挂载点时才用 rslave：面板里装的应用容器要能跟着看到 /mnt 的变化。
-	mnt_opt="/mnt:/mnt"
-	mountpoint -q /mnt 2>/dev/null && mnt_opt="/mnt:/mnt:rslave"
+	# 面板里装的应用容器要能读到数据盘，所以把 /mnt 下真实的挂载点逐个 bind。
+	# 不能用 /mnt:/mnt:rslave —— /mnt 往往不是独立挂载点、父挂载是 private，
+	# docker 会报 "path /mnt is mounted on / but it is not a shared or slave mount"。
+	mnt_vols=""
+	for d in /mnt/*; do
+		[ -d "$d" ] || continue
+		mountpoint -q "$d" 2>/dev/null || continue
+		mnt_vols="$mnt_vols      - '$(printf '%s:%s' "$d" "$d")'\n"
+	done
+	[ -n "$mnt_vols" ] || mnt_vols="      - '/mnt:/mnt'\n"
 
 	mkdir -p "$(dirname "$f")" || return 1
 
@@ -273,7 +280,7 @@ compose_write() {
 		echo "      PASSWORD: $(yaml_q "$PASS_C")"
 		echo "    volumes:"
 		echo "      - '/var/run/docker.sock:/var/run/docker.sock'"
-		echo "      - '$mnt_opt'"
+		printf '%b' "$mnt_vols"
 		echo "      - '/sys/fs/cgroup:/sys/fs/cgroup'"
 		# 不挂 /etc/localtime：OpenWrt 上它是指向 /usr/share/zoneinfo/ 的符号链接，
 		# 目标常常不存在（zoneinfo 没装），Docker 创建挂载源时会 mkdir 已存在的路径，
