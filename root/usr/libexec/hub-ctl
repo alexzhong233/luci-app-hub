@@ -201,6 +201,12 @@ spawn_task() {
 }
 
 # ---------------------------------------------------------------- 数据目录
+# 目录所在分区的剩余空间（KB），与 1panel-ctl / workbuddy2api-ctl 的字段同名，
+# 页面顶部状态卡统一显示。
+free_kb() {
+	df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
 is_mnt_ok() {
 	[ -d /mnt/sda1 ] && [ -w /mnt/sda1 ] && mountpoint -q /mnt/sda1 2>/dev/null
 }
@@ -246,6 +252,8 @@ svc_datadir() {
 # ================================================================ qBittorrent
 qb_variant() { cfg_def qbittorrent.variant luci; }
 qb_port() { cfg_def qbittorrent.port 8090; }
+# bridge 网络下宿主机映射端口，默认与容器内端口相同
+qb_host_port() { cfg_def qbittorrent.host_port "$(qb_port)"; }
 qb_bt_port() { cfg_def qbittorrent.bt_port 21142; }
 qb_net() { cfg_def qbittorrent.network host; }
 qb_downloads() { cfg_def qbittorrent.downloads "/mnt/sda1/movie"; }
@@ -302,8 +310,10 @@ qb_compose_write() {
 		if [ "$net" = "host" ]; then
 			echo "    network_mode: host"
 		else
+			# 容器内监听的仍是 $port（WEBUI_PORT / conf 里都是它），
+			# 宿主机侧用单独配的 host_port，两者可以不同。
 			echo "    ports:"
-			echo "      - '$port:$port/tcp'"
+			echo "      - '$(qb_host_port):$port/tcp'"
 			echo "      - '$bt:$bt/tcp'"
 			echo "      - '$bt:$bt/udp'"
 		fi
@@ -676,6 +686,7 @@ qb_status() {
 	echo "qb_ct=$cstate"
 	echo "qb_running=$running"
 	echo "qb_port=$(qb_port)"
+	echo "qb_host_port=$(qb_host_port)"
 	echo "qb_port_busy=$listen"
 	echo "qb_bt_port=$(qb_bt_port)"
 	echo "qb_network=$(qb_net)"
@@ -689,6 +700,7 @@ qb_status() {
 # ================================================================ OpenList
 ol_variant() { cfg_def openlist.variant openlist2; }
 ol_port() { cfg_def openlist.port 5244; }
+ol_host_port() { cfg_def openlist.host_port "$(ol_port)"; }
 ol_net() { cfg_def openlist.network host; }
 ol_datadir() {
 	local explicit
@@ -743,8 +755,8 @@ ol_compose_write() {
 		else
 			echo "    ports:"
 			# 容器内固定监听 5244（官方镜像的默认值，端口写在它自己的配置里），
-			# 宿主机端口用 hub 里配的那个。host 网络下不映射，所以只能是 5244。
-			echo "      - '$port:5244/tcp'"
+			# 宿主机端口用 host_port。host 网络下不映射，所以只能是 5244。
+			echo "      - '$(ol_host_port):5244/tcp'"
 		fi
 		echo "    environment:"
 		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
@@ -976,6 +988,7 @@ ol_status() {
 	echo "ol_ct=$cstate"
 	echo "ol_running=$running"
 	echo "ol_port=$(ol_port)"
+	echo "ol_host_port=$(ol_host_port)"
 	echo "ol_port_busy=$listen"
 	echo "ol_network=$(ol_net)"
 	echo "ol_datadir=$(ol_datadir)"
@@ -999,6 +1012,12 @@ cmd_status() {
 	/mnt/*) echo "dockerroot_ok=1" ;;
 	*) echo "dockerroot_ok=0" ;;
 	esac
+	# 顶部状态卡用的剩余空间：数据盘与 overlay
+	echo "data_free_kb=$(free_kb "$(data_root)")"
+	echo "overlay_free_kb=$(free_kb /)"
+	echo "qb_config_free_kb=$(free_kb "$(qb_datadir)")"
+	echo "ol_config_free_kb=$(free_kb "$(ol_datadir)")"
+
 	qb_status
 	ol_status
 }

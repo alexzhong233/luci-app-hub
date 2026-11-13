@@ -11,6 +11,12 @@
 
 四个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
 
+版式沿用 `luci-app-1panel` 与 `luci-app-workbuddy2api` 原来那套：顶部是两列的状态卡，
+下面是两列网格表单，再下面一排动作按钮，最底下是命令输出。用 CSS Grid 而不是
+`<table>` / `cbi-value`，是因为 Argon、Aurora 这类主题对 `th`/`td` 和
+`.cbi-value-title` 有高特异性的 `!important` 规则，会把表头和数据行拆成不同的盒模型，
+HTML 表格在这种主题下必然错位。
+
 ## 为什么合并
 
 qBittorrent 在 OpenWrt 上的原生包有个反复踩的坑：`/etc/init.d/qbittorrent` 每次
@@ -31,6 +37,11 @@ SIGTERM 时又会把内存里的配置写回文件——两者次序不固定，
 1. `hub.<服务名>.datadir`（UCI 里显式指定）
 2. `/mnt/sda1/Configs/services/<服务名>`（`/mnt/sda1` 已挂载且可写时）
 3. 该服务原生版的位置（`/etc/qBittorrent`、`/etc/openlist2`、`/etc/openlist`）
+
+页面上**数据目录是可改的**（qBittorrent 与 OpenList 各一个输入框）：改成别的路径后点
+「启动」或「安装」，ctl 会把原目录内容迁到新位置，再把 `/etc/...` 换成指向新位置的
+符号链接——目录层级不变，所以读到的还是同一份 `qBittorrent.conf` / `data.db`。
+迁移时**目标目录里已有的同名文件不覆盖**（以你指定的那份为准）。留空则回到上面第 2、3 条。
 
 qBittorrent 的 `config` 子目录里是 `qBittorrent.conf` 和 `BT_backup`，后者装着种子
 和做种记录，**切换运行方式或重装都不要删这个目录**。
@@ -162,7 +173,13 @@ uci commit dockerd
 | qB BT 端口 | 同上 | 立即 |
 | qB WebUI 密码 | 页面填新密码点「设置」 | 立即 |
 | OpenList 端口 | 页面填，改完自动重启 | 原生版立即；容器 host 网络固定 5244 |
+| bridge 映射端口 | 容器网络选 bridge 后多出一个「映射端口」 | 立即（重建容器） |
 | OpenList 管理员密码 | 页面填新密码点「设置」 | 立即 |
+
+容器网络选 **bridge** 时会多出一个「映射端口」：容器里仍监听原来那个端口
+（qB 的 `WEBUI_PORT` 与 conf、OpenList 固定的 5244），宿主机侧用这个映射端口对外，
+所以 8080 被 Nikki 占着也可以把 qB 映射到 18090 之类。host 网络下没有映射，端口就是
+「端口」那个值。
 
 端口会同步写进各包自己的配置（`qbittorrent.config.http_port`、
 `qBittorrent.conf` 的 `WebUI\Port` / `Session\Port`、`openlist2.config.port`、
