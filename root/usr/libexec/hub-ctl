@@ -505,12 +505,16 @@ qb_compose_write() {
 # hub 的 datadir。不处理的话「原生 ↔ 容器」互切就是两套毫不相干的数据，
 # 换一次版本等于换一个空面板。
 #
-# 做法：datadir 是唯一真相，原生目录是它的副本。
-#   启动前  datadir  → /etc/xxx（整份复制，先清空）
-#   停止后  /etc/xxx → datadir （回写）
-#   /etc/qBittorrent 是真的目录，不是符号链接 —— ls、备份、文件管理器都正常。
-# 层级天然对齐：qB 原生读 <dir>/config/qBittorrent.conf，容器读 /config/…；
-# OpenList 原生读 <dir>/data.db，容器读 /opt/openlist/data/data.db。
+# 两边互为镜像，**谁的文件新听谁的**（按 mtime 双向合并）：
+#   · 同名文件比 mtime，新的覆盖旧的
+#   · 只在一侧存在的文件补到另一侧
+#   · 从不删除（删除只发生在卸载、重装前的清目录）
+#
+# 为什么不固定「以 datadir 为准」：原生版真正在写的是 /etc，容器版写的是
+# datadir，用户还可能直接编辑 /etc 里的 config.json。固定方向一旦遇到
+# 「只恢复了 /etc」「原生版异常退出没来得及回写」这类情况，就会拿旧数据
+# 把新的盖掉 —— 数据看着就"丢了"。按 mtime 合并没有这个问题：
+# 哪边在写哪边的时间就新，天然成立。
 
 # 目录里有真数据吗（不存在或空目录都算没有）
 has_data() {
@@ -518,53 +522,138 @@ has_data() {
 	[ -n "$(ls -A "$1" 2>/dev/null)" ]
 }
 
-# datadir → 原生目录：整份铺过去。先清空，免得残留上一次的旧文件。
-sync_push() {
-	local dir="$1" native="$2" need avail
+# 文件 mtime（epoch 秒）。busybox 的 stat 一般有，没有就退回 date -r。
+file_mtime() {
+	local t
 
-	[ -n "$dir" ] && [ -n "$native" ] || return 0
+	t=$(stat -c %Y "$1" 2>/dev/null)
+	[ -n "$t" ] || t=$(date -r "$1" +%s 2>/dev/null)
+	case "$t" in
+	'' | *[!0-9]*) t=0 ;;
+	esac
+	echo "$t"
+}
+
+# OpenList 的 sqlite 三件套：db + WAL + SHM 必须当一个整体搬。
+# 新旧拼在一起（新 db 配旧 WAL）会让 sqlite 读到不属于这个库的日志，直接损坏。
+sqlite_mtime() {
+	local t=0 f m
+
+	for f in data.db data.db-wal data.db-shm; do
+		[ -f "$1/$f" ] || continue
+		m=$(file_mtime "$1/$f")
+		[ "$m" -gt "$t" ] && t=$m
+	done
+	echo "$t"
+}
+
+# sync_sqlite_group <原生目录> <datadir> <pref>
+# pref=dir 时以数据盘那份为准（/etc 那边来历不明），否则比时间。
+sync_sqlite_group() {
+	local a="$1" b="$2" pref="$3" ta tb src dst f
+
+	ta=$(sqlite_mtime "$a")
+	tb=$(sqlite_mtime "$b")
+	[ "$ta" = 0 ] && [ "$tb" = 0 ] && return 0
+
+	if [ "$pref" = "dir" ] && [ "$tb" != 0 ]; then
+		src="$b"
+		dst="$a"
+	elif [ "$ta" -ge "$tb" ]; then
+		src="$a"
+		dst="$b"
+	else
+		src="$b"
+		dst="$a"
+	fi
+
+	for f in data.db data.db-wal data.db-shm; do
+		[ -f "$src/$f" ] && cp -a "$src/$f" "$dst/$f"
+	done
+
+	# 对面多出来的 WAL/SHM 是上一份库留下的，必须清掉，否则新库会读到旧日志
+	for f in data.db-wal data.db-shm; do
+		[ -f "$dst/$f" ] && [ ! -f "$src/$f" ] && rm -f "$dst/$f"
+	done
+	return 0
+}
+
+# sync_merge <原生目录> <datadir>
+#
+# 两边互为镜像，按 mtime 合并；只有一种情况不按 mtime：
+# /etc 那个目录里没有 .hub-mirror 标记 —— 说明它不是 hub 维持的（刚刷完机、
+# 刚从包里解出来），里面所有文件的 mtime 都是「打包时间」，比用户数据还新，
+# 照着 mtime 比就会拿一个空库把 /mnt 上的真数据盖掉。这时以数据盘为准，
+# 合完补上标记，从此两边都比 mtime。
+#
+# 原生目录在 overlay 上，先确认放得下再动手（写满 / 会让整个系统起不来）。
+sync_merge() {
+	local native="$1" dir="$2" need avail rel fa fb ta tb pref
+
+	[ -n "$native" ] && [ -n "$dir" ] || return 0
 	[ "$dir" = "$native" ] && return 0
-	has_data "$dir" || return 0
 
 	need=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
 	avail=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
-
-	# overlay 很小，qB 的 BT_backup 有几个种子就几十 MB，装不下就别硬拷，
-	# 否则 /etc 会被写满连带系统一起挂。
 	if [ -n "$need" ] && [ -n "$avail" ] && [ "$need" -gt "$((avail - 8192))" ]; then
 		echo "!! overlay 只剩 $((avail / 1024))MB，放不下 $((need / 1024))MB 的数据" >&2
 		return 1
 	fi
 
-	rm -rf "$native" || return 1
-	mkdir -p "$native" || return 1
-	cp -a "$dir/." "$native/" || return 1
-	echo "-- $dir → $native（$((need / 1024))MB）"
+	mkdir -p "$native" "$dir" 2>/dev/null || return 1
+
+	# 谁是「更新的一方」：
+	#   mtime —— 两边都是 hub 同步过的，比时间
+	#   dir   —— /etc 那份来历不明，以数据盘为准
+	pref="mtime"
+	[ -f "$native/.hub-mirror" ] || pref="dir"
+
+	sync_sqlite_group "$native" "$dir" "$pref"
+
+	{
+		( cd "$native" 2>/dev/null && find . -type f -print 2>/dev/null )
+		( cd "$dir" 2>/dev/null && find . -type f -print 2>/dev/null )
+	} | sed 's#^\./##' | grep -v '^$' | sort -u |
+		while IFS= read -r rel; do
+			case "$rel" in
+			data.db | data.db-wal | data.db-shm) continue ;;
+			.hub-mirror | .confpath | .docker-variant) continue ;;
+			esac
+
+			fa="$native/$rel"
+			fb="$dir/$rel"
+
+			if [ ! -e "$fb" ]; then
+				mkdir -p "${fb%/*}" 2>/dev/null
+				cp -a "$fa" "$fb" 2>/dev/null
+				continue
+			fi
+			if [ ! -e "$fa" ]; then
+				mkdir -p "${fa%/*}" 2>/dev/null
+				cp -a "$fb" "$fa" 2>/dev/null
+				continue
+			fi
+
+			if [ "$pref" = "dir" ]; then
+				cmp -s "$fa" "$fb" 2>/dev/null || cp -a "$fb" "$fa" 2>/dev/null
+				continue
+			fi
+
+			ta=$(file_mtime "$fa")
+			tb=$(file_mtime "$fb")
+			if [ "$ta" -gt "$tb" ]; then
+				cp -a "$fa" "$fb" 2>/dev/null
+			elif [ "$tb" -gt "$ta" ]; then
+				cp -a "$fb" "$fa" 2>/dev/null
+			elif ! cmp -s "$fa" "$fb" 2>/dev/null; then
+				# 同一秒内两边都动过、内容又不一样：以正在写的那侧（原生目录）为准
+				cp -a "$fa" "$fb" 2>/dev/null
+			fi
+		done
+
+	# 记一笔：这个 /etc 目录是 hub 维持的，下次可以放心比 mtime
+	date +%s >"$native/.hub-mirror" 2>/dev/null
 	return 0
-}
-
-# 原生目录 → datadir：把运行期间的写入搬回去（同名覆盖，datadir 里其它文件保留）
-sync_pull() {
-	local native="$1" dir="$2"
-
-	[ -n "$native" ] && [ -n "$dir" ] || return 0
-	[ "$dir" = "$native" ] && return 0
-	has_data "$native" || return 0
-
-	mkdir -p "$dir" || return 1
-	cp -a "$native/." "$dir/" || return 1
-	echo "-- $native → $dir（回写）"
-	return 0
-}
-
-# datadir 还是空的、原生目录里已经有数据（固件预装 openlist2 就是这样），
-# 先把这份收编进 datadir。否则用户启动一次、数据仍然只写在 overlay 上，刷机就没了。
-adopt_native() {
-	local dir="$1" native="$2"
-
-	has_data "$dir" && return 0
-	has_data "$native" || return 0
-	sync_pull "$native" "$dir"
 }
 
 # 装包前清掉原生目录：apk 往已经存在的目录里解包会报 trying to overwrite，
@@ -597,10 +686,10 @@ qb_stop_all() {
 	sleep 1
 	killall -9 qbittorrent-nox >/dev/null 2>&1
 
-	# 停干净了把 /etc 里那份搬回 datadir。
-	# 纯容器版时 /etc/qBittorrent 是上一次装原生版留下的旧货，拿它覆盖
-	# 容器的数据会把配置改回几天前 —— 所以只在原生版存在时才回写。
-	[ "$had_native" = 1 ] && sync_pull /etc/qBittorrent "$(qb_datadir)"
+	# 停干净了跟 datadir 合一次：谁的文件新听谁的。
+	# 纯容器版时 /etc/qBittorrent 是上一次装原生版留下的旧货，mtime 比
+	# 容器的数据老，合并不动它 —— 不会再把配置改回几天前。
+	sync_merge /etc/qBittorrent "$(qb_datadir)"
 	return 0
 }
 
@@ -649,11 +738,11 @@ qb_worker_install() {
 		;;
 	esac
 
-	# 原生版把 datadir 铺回 /etc（包管理器刚建了个空目录）；
+	# 原生版跟 datadir 合并回 /etc（包管理器刚建了个空目录）；
 	# 容器版直接挂 datadir，什么都不用做。
 	case "$v" in
 	docker | docker-ee) ;;
-	*) sync_push "$(qb_datadir)" /etc/qBittorrent >/dev/null 2>&1 ;;
+	*) sync_merge /etc/qBittorrent "$(qb_datadir)" >/dev/null 2>&1 ;;
 	esac
 
 	# 容器版两个变体共用同一个容器名，光看容器状态分不出装的是哪个，
@@ -678,8 +767,9 @@ qb_worker_install() {
 
 # 直接改 qBittorrent.conf 里的两个端口。conf 不存在（还没装）就什么都不做。
 #
-# datadir 那份是真相，/etc 那份是原生版正在用的副本 —— 两份都要改，
-# 否则下次启动 sync_push 会把 datadir 的旧值盖回去。
+# 原生版读 /etc 那份、容器版读 datadir 那份，两份都改掉最省心：
+# 只改一份也能生效（改完 mtime 就更新了，合并时它会赢），但 qB 退出时
+# 可能把自己内存里的配置写回 conf，所以能写两份就写两份。
 qb_write_conf_port() {
 	local port="$1" bt="$2" dir conf
 
@@ -880,8 +970,8 @@ ol_set_password() {
 		}
 		"$bin" --data "$dir" admin set "$pass" || return 1
 
-		# 改的是 /etc 那份就顺手搬回 datadir
-		sync_pull "$dir" "$(ol_datadir)"
+		# 改的是 /etc 那份就顺手合回 datadir
+		[ "$dir" = "$(ol_datadir)" ] || sync_merge "$dir" "$(ol_datadir)"
 		;;
 	esac
 }
@@ -894,8 +984,8 @@ qb_start() {
 	case "$v" in
 	docker | docker-ee) ;;
 	*)
-		sync_push "$(qb_datadir)" /etc/qBittorrent ||
-			echo "!! 数据没铺到 /etc/qBittorrent，qB 会以空配置启动" >&2
+		sync_merge /etc/qBittorrent "$(qb_datadir)" ||
+			echo "!! 数据没同步到 /etc/qBittorrent，qB 可能以空配置启动" >&2
 		;;
 	esac
 
@@ -1190,10 +1280,10 @@ ol_stop_all() {
 	ct_running "$OL_CT" && docker stop "$OL_CT" >/dev/null 2>&1
 	sleep 1
 
-	# 原生版的活数据在 /etc，停干净了搬回 datadir
+	# 原生版的活数据在 /etc，停干净了跟 datadir 合一次（新的赢）
 	case "$k" in
-	openlist2) sync_pull /etc/openlist2 "$(ol_datadir)" ;;
-	feeds) sync_pull /etc/openlist "$(ol_datadir)" ;;
+	openlist2) sync_merge /etc/openlist2 "$(ol_datadir)" ;;
+	feeds) sync_merge /etc/openlist "$(ol_datadir)" ;;
 	esac
 	return 0
 }
@@ -1245,12 +1335,12 @@ ol_worker_install() {
 		;;
 	esac
 
-	# 原生版把 datadir 铺回去（包刚建的空目录）；容器版直接挂 datadir
+	# 原生版跟 datadir 合并回去（包刚建的空目录，等于整份铺）；容器版直接挂 datadir
 	ol_apply_paths "$v"
 	case "$v" in
 	docker) ;;
-	feeds) sync_push "$(ol_datadir)" /etc/openlist >/dev/null 2>&1 ;;
-	*) sync_push "$(ol_datadir)" /etc/openlist2 >/dev/null 2>&1 ;;
+	feeds) sync_merge /etc/openlist "$(ol_datadir)" >/dev/null 2>&1 ;;
+	*) sync_merge /etc/openlist2 "$(ol_datadir)" >/dev/null 2>&1 ;;
 	esac
 
 	save_cfg openlist "variant=$v"
@@ -1271,26 +1361,26 @@ ol_start() {
 	[ -n "$k" ] || k="$v"
 
 	# 先把 config.json 里的库路径摆成这个运行方式该有的样子，再往下同步 ——
-	# 顺序反了的话 sync_push 会把旧路径一起铺到 /etc，原生版就找不到库了。
+	# 顺序反了的话合并会把旧路径一起带到 /etc，原生版就找不到库了。
 	ol_apply_paths "$v"
 
-	# 原生版：datadir 那份铺到 /etc。
-	# 刷机后 /etc 是包自带的初始库、datadir 还在 /mnt 上 —— 以 datadir 为准；
-	# 反过来（刚预装、datadir 空）先把 /etc 收编进 datadir，别让数据只活在 overlay。
+	# 原生版：跟 datadir 双向合并（新的赢）。
+	# 刷机后 /etc 是包自带的初始库、datadir 还在 /mnt 上 —— 初始库 mtime 是
+	# 打包时间，比用户数据老，合并不动它；
+	# 反过来（刚预装、datadir 空）会把 /etc 那份补进 datadir，别让数据只活在 overlay。
+	# 用户手改过 /etc 里的 config.json 时也只有新的那侧留下 —— 不再「数据盘说了算」。
 	case "$v" in
 	docker) ;;
 	openlist2)
-		adopt_native "$(ol_datadir)" /etc/openlist2
-		sync_push "$(ol_datadir)" /etc/openlist2 || echo "!! 数据没铺到 /etc/openlist2" >&2
+		sync_merge /etc/openlist2 "$(ol_datadir)" || echo "!! 数据没同步到 /etc/openlist2" >&2
 		;;
 	feeds)
-		adopt_native "$(ol_datadir)" /etc/openlist
-		sync_push "$(ol_datadir)" /etc/openlist || echo "!! 数据没铺到 /etc/openlist" >&2
+		sync_merge /etc/openlist "$(ol_datadir)" || echo "!! 数据没同步到 /etc/openlist" >&2
 		;;
 	*)
 		case "$k" in
-		openlist2) sync_push "$(ol_datadir)" /etc/openlist2 >/dev/null 2>&1 ;;
-		feeds) sync_push "$(ol_datadir)" /etc/openlist >/dev/null 2>&1 ;;
+		openlist2) sync_merge /etc/openlist2 "$(ol_datadir)" >/dev/null 2>&1 ;;
+		feeds) sync_merge /etc/openlist "$(ol_datadir)" >/dev/null 2>&1 ;;
 		esac
 		;;
 	esac
