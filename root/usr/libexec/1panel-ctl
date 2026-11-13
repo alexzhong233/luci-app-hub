@@ -20,7 +20,7 @@ TASK_DIR="/var/run/1panel-task"
 
 CT_NAME="1panel"
 CT_IMAGE_DEFAULT="moelin/1panel:v2"
-DIR_DEFAULT="/mnt/sda1/Configs/1Panel"
+DIR_DEFAULT="/mnt/sda1/Configs/1panel"
 
 # ---------------------------------------------------------------- 配置存取
 cfg() {
@@ -565,6 +565,10 @@ cmd_status() {
 # 写在 overlay 上的东西刷机就没了。
 cmd_disks() {
 	df -k 2>/dev/null | awk 'NR>1 && $6 ~ /^\/mnt\// {print "disk=" $6 ":" $4}'
+	# /opt 多数机器上就在 overlay 里，df 不把它当挂载点单列，但一样能放数据
+	if [ -d /opt ] && [ -w /opt ]; then
+		echo "disk=/opt:$(df -k /opt 2>/dev/null | awk 'NR==2 {print $4}')"
+	fi
 	return 0
 }
 
@@ -758,9 +762,9 @@ cmd_install() {
 	RUN_DIR_N="$DATADIR_N/1panel"
 
 	case "$DATADIR_N" in
-		/mnt/*) ;;
+		/mnt/* | /opt/*) ;;
 		*)
-			echo "数据目录必须位于 /mnt 下（当前：$DATADIR_N）" >&2
+			echo "数据目录必须在 /mnt 或 /opt 下（当前：$DATADIR_N）" >&2
 			echo "面板的数据库、日志、备份都写这里；放 overlay 会写满 flash，刷机也会丢。" >&2
 			return 2
 			;;
@@ -897,9 +901,9 @@ cmd_ct_install() {
 	RUN_DIR_C="$DATADIR_C/1panel"
 
 	case "$DATADIR_C" in
-		/mnt/*) ;;
+		/mnt/* | /opt/*) ;;
 		*)
-			echo "数据目录必须位于 /mnt 下（当前：$DATADIR_C）" >&2
+			echo "数据目录必须在 /mnt 或 /opt 下（当前：$DATADIR_C）" >&2
 			return 2
 			;;
 	esac

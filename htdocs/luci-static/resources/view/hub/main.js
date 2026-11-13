@@ -81,7 +81,7 @@ var OL_MODES = [
 		how: _('sbwml 的 openlist2，带自己的 LuCI 页面'),
 		notes: [
 			_('官方源里没有这个包，安装时从作者的 GitHub release 下预编译包（约 22MB）。'),
-			_('数据目录 /etc/openlist2 会链接到上面那个通用数据目录。'),
+			_('原生版的数据在 /etc/openlist2，启动时从上面那个通用目录复制过去、停止时写回。'),
 			_('菜单在「NAS → OpenList2」，本页只管装和启停。')
 		]
 	},
@@ -91,7 +91,7 @@ var OL_MODES = [
 		how: _('apk 装 openlist（immortalwrt feeds 里的官方包）'),
 		notes: [
 			_('不带 LuCI 页面，只有 /etc/init.d/openlist 和 /usr/bin/openlist。'),
-			_('数据目录 /etc/openlist 同样链接到通用数据目录，和另两种共用一份库。'),
+			_('原生版的数据在 /etc/openlist，同样与通用目录来回同步，和另两种共用一份库。'),
 			_('要改端口就改上面的通用端口，会同步进 openlist 自己的 UCI。')
 		]
 	},
@@ -323,6 +323,7 @@ return view.extend({
 			latest: '',
 			disks: [],
 			disksWb: [],
+			nets: [],
 			sig: ''
 		};
 
@@ -537,10 +538,19 @@ return view.extend({
 				});
 			});
 
+			/* .hub-form 里的 input 是 width:100%，和按钮并排时会把按钮挤到
+			   只剩一个字宽（「设」换行成「置」）。所以给输入框留弹性的份额，
+			   按钮自己不许被压缩。 */
+			btn.style.whiteSpace = 'nowrap';
+			btn.style.flex = '0 0 auto';
+
 			return [
 				E('label', {}, [ label ]),
 				E('div', {}, [
-					E('div', { 'style': 'display:flex;gap:.5rem;align-items:center' }, [ input, btn ]),
+					E('div', { 'style': 'display:flex;gap:.5rem;align-items:center' }, [
+						E('div', { 'style': 'flex:1 1 auto;min-width:0' }, [ input ]),
+						btn
+					]),
 					muted(' ' + hint)
 				])
 			];
@@ -609,8 +619,8 @@ return view.extend({
 			items.push([ _('数据目录'), E('span', {}, [
 				E('code', {}, [ st.qb_datadir || '—' ]),
 				flag(st.qb_datalink)
-					? muted('  ' + _('原生版已链接到此处，与容器版共用一份'))
-					: muted('  ' + _('未链接（数据在 /etc 上）'))
+					? muted('  ' + _('原生版启动前从这里复制、停止后写回，与容器版共用一份'))
+					: muted('  ' + _('未同步（数据还在 /etc 上）'))
 			]) ]);
 
 			items.push([ _('配置目录'), E('span', {}, [
@@ -674,7 +684,7 @@ return view.extend({
 			});
 
 			var fDir = once(inputs.qb, 'dir', function() {
-				return textInput(st.qb_datadir || '', '/mnt/sda1/Configs/services/qbittorrent');
+				return textInput(st.qb_datadir || '', '/mnt/sda1/Configs/qbittorrent');
 			});
 			bindOnce(fDir, 'change', function() {
 				saveCfg(sec, { datadir: fDir.value.trim() }).then(function() {
@@ -698,10 +708,10 @@ return view.extend({
 
 				E('label', {}, [ _('数据目录') ]),
 				E('div', {}, [
-					diskSelect(state.disks, 'Configs/services/qbittorrent', fDir),
+					diskSelect(state.disks, 'Configs/qbittorrent', fDir),
 					E('div', { 'style': 'margin:.35rem 0' }, [ fDir ]),
 					muted(_('配置、种子、做种记录都放这里。改路径后下次启动会把原目录内容迁过去、'
-						+ '再把 /etc/qBittorrent 换成指向新位置的链接，数据不会丢。'))
+						+ '再把 /etc/qBittorrent 里的内容换到新位置（启动时复制过去），数据不会丢。'))
 				])
 			].concat(passwordRow(_('WebUI 密码'), fPass,
 				function(v) { return setPass('qbittorrent', v, _('设置 qB 密码')); },
@@ -731,49 +741,17 @@ return view.extend({
 				E('div', { 'class': 'cbi-map-descr' }, [ mode.how, E('br') ].concat(mode.notes))
 			];
 
-			/* 容器版：网络与映射端口放在这里，host 下没有映射 */
+			/* 容器版固定 host：BT 要接大量入站连接，bridge 走 NAT 还得给 BT 端口
+			   单独做映射，出问题也难查。不给选项，省得选错了再来找原因。 */
 			if (isDocker) {
-				var net = st.qb_network || 'host';
-
-				var fNet = once(inputs.qb, 'net', function() {
-					return selectInput([
-						{ value: 'host', label: _('host（推荐，BT 连接数不受 NAT 影响）') },
-						{ value: 'bridge', label: _('bridge（需要端口映射）') }
-					], net);
-				});
-				bindOnce(fNet, 'change', function() {
-					saveCfg('qbittorrent', { network: fNet.value }).then(function() {
-						return refresh(true);
-					});
-				});
-
-				var fHostPort = once(inputs.qb, 'hostport', function() {
-					return textInput(st.qb_host_port || st.qb_live_port || st.qb_port || '8090', '8090');
-				});
-				bindOnce(fHostPort, 'change', function() {
-					saveCfg('qbittorrent', { host_port: fHostPort.value.trim() || st.qb_port || '8090' })
-						.then(function() {
-							return running ? run(HUB, [ 'restart', 'qbittorrent' ], _('按新映射端口重启')) : null;
-						});
-				});
-
-				var netRows = [
+				body.push(E('div', { 'class': 'hub-form', 'style': 'margin-top:1rem' }, [
 					E('label', {}, [ _('容器网络') ]),
-					E('div', {}, [ fNet, muted(' ' + _('host 与宿主机共用网络栈，端口就是上面那个；'
-						+ 'bridge 走 NAT，需要映射。')) ])
-				];
-
-				if (net === 'bridge')
-					netRows = netRows.concat([
-						E('label', {}, [ _('映射端口') ]),
-						E('div', {}, [
-							fHostPort,
-							muted(_(' 宿主机侧端口 → 容器内端口。容器里仍监听上面的 WebUI 端口，'
-								+ '这里只改对外映射。BT 端口保持 1:1。'))
-						])
-					]);
-
-				body.push(E('div', { 'class': 'hub-form', 'style': 'margin-top:1rem' }, netRows));
+					E('div', {}, [
+						E('code', {}, [ 'host' ]),
+						muted('  ' + _('固定用 host，容器内端口就是宿主机端口，和上面的通用设置一致。'
+							+ 'BT 需要直接的入站连接，不做 NAT 映射。'))
+					])
+				]));
 			}
 
 			var ops = [];
@@ -879,8 +857,8 @@ return view.extend({
 			items.push([ _('数据目录'), E('span', {}, [
 				E('code', {}, [ st.ol_datadir || '—' ]),
 				flag(st.ol_datalink)
-					? muted('  ' + _('原生版已链接到此处，三种方式共用一份'))
-					: muted('  ' + _('未链接（数据在 /etc 上）'))
+					? muted('  ' + _('原生版启动前从这里复制、停止后写回，三种方式共用一份'))
+					: muted('  ' + _('未同步（数据还在 /etc 上）'))
 			]) ]);
 
 			items.push([ _('数据盘剩余'), mb(st.ol_config_free_kb || st.data_free_kb) ]);
@@ -912,7 +890,7 @@ return view.extend({
 			});
 
 			var fDir = once(inputs.ol, 'dir', function() {
-				return textInput(st.ol_datadir || '', '/mnt/sda1/Configs/services/openlist');
+				return textInput(st.ol_datadir || '', '/mnt/sda1/Configs/openlist');
 			});
 			bindOnce(fDir, 'change', function() {
 				saveCfg(sec, { datadir: fDir.value.trim() }).then(function() {
@@ -930,9 +908,9 @@ return view.extend({
 
 				E('label', {}, [ _('数据目录') ]),
 				E('div', {}, [
-					diskSelect(state.disks, 'Configs/services/openlist', fDir),
+					diskSelect(state.disks, 'Configs/openlist', fDir),
 					E('div', { 'style': 'margin:.35rem 0' }, [ fDir ]),
-					muted(_('config.json 与 data.db 都在这里。/etc/openlist2 与 /etc/openlist 会被链接到同一位置，'
+					muted(_('config.json 与 data.db 都在这里。/etc/openlist2 与 /etc/openlist 启动时从这里复制，'
 						+ '容器版挂的也是这里。改路径后启动时自动迁移，数据不会丢。'))
 				])
 			].concat(passwordRow(_('管理员密码'), fPass,
@@ -964,11 +942,24 @@ return view.extend({
 			if (v === 'docker') {
 				var net = st.ol_network || 'host';
 
+				/* host 之外还有 docker 里现成的桥接网络可选（macvlan/自定义 bridge），
+				   列表是 hub-ctl networks 查出来的，跟磁盘候选一样是首屏之后异步补的 */
 				var fNet = once(inputs.ol, 'net', function() {
-					return selectInput([
-						{ value: 'host', label: _('host（推荐）') },
-						{ value: 'bridge', label: _('bridge（需要端口映射）') }
-					], net);
+					var opts = [
+						{ value: 'host', label: _('host（推荐，端口就是上面的端口）') },
+						{ value: 'bridge', label: _('bridge（默认网桥，需要端口映射）') }
+					];
+
+					(state.nets || []).forEach(function(n) {
+						opts.push({ value: n, label: n });
+					});
+
+					/* 之前选的自定义网络这会儿可能已经被删了，补一条免得下拉空白 */
+					if (net !== 'host' && net !== 'bridge' &&
+						(state.nets || []).indexOf(net) < 0)
+						opts.push({ value: net, label: net + _('（已不存在）') });
+
+					return selectInput(opts, net);
 				});
 				bindOnce(fNet, 'change', function() {
 					saveCfg('openlist', { network: fNet.value }).then(function() {
@@ -988,10 +979,11 @@ return view.extend({
 
 				var netRows = [
 					E('label', {}, [ _('容器网络') ]),
-					E('div', {}, [ fNet, muted(' ' + _('host 下容器固定监听 5244，宿主机也就只能是 5244。')) ])
+					E('div', {}, [ fNet, muted(' ' + _('host 下容器固定监听 5244，宿主机也就只能是 5244；'
+						+ '要换端口就选 bridge 或自己的桥接网络，再填映射端口。')) ])
 				];
 
-				if (net === 'bridge')
+				if (net !== 'host')
 					netRows = netRows.concat([
 						E('label', {}, [ _('映射端口') ]),
 						E('div', {}, [ fHostPort,
@@ -1032,7 +1024,7 @@ return view.extend({
 
 			if (installed && running)
 				ops.push(openAnchor(_('打开面板'), st.lanip,
-					(st.ol_network || 'host') === 'bridge' ? (st.ol_host_port || st.ol_port) : st.ol_port));
+					(st.ol_network || 'host') !== 'host' ? (st.ol_host_port || st.ol_port) : st.ol_port));
 
 			body.push(E('div', { 'class': 'hub-actions', 'style': 'margin-top:1rem' }, ops));
 			body.push(taskBox(st.task));
@@ -1205,8 +1197,8 @@ return view.extend({
 			var fUser = textInput((isC ? st.container_username : st.native_username) || '1panel', '1panel');
 			var fPass = textInput('', _('至少 8 位'), 'password');
 			var fEnt = textInput('', _('例如 panel-8x3k，别用 entrance'));
-			var fDir = textInput((isC ? st.container_datadir : st.native_datadir) || '/mnt/sda1/Configs/1Panel',
-				'/mnt/sda1/Configs/1Panel');
+			var fDir = textInput((isC ? st.container_datadir : st.native_datadir) || '/mnt/sda1/Configs/1panel',
+				'/mnt/sda1/Configs/1panel');
 			var fImg = textInput(st.container_image || 'moelin/1panel:v2', 'moelin/1panel:v2');
 
 			var chkRoot = E('input', { 'type': 'checkbox' });
@@ -1250,7 +1242,7 @@ return view.extend({
 				E('label', {}, [ _('入口路径') ]), fEnt,
 				E('label', {}, [ _('数据目录') ]),
 				E('div', {}, [
-					diskSelect(state.disks, 'Configs/1Panel', fDir),
+					diskSelect(state.disks, 'Configs/1panel', fDir),
 					E('div', { 'style': 'margin:.35rem 0' }, [ fDir ]),
 					muted(' ' + _('必须在 /mnt 下；面板的数据库、备份、应用都写这里'))
 				])
@@ -1761,6 +1753,25 @@ return view.extend({
 			});
 		}
 
+		/* docker 里的桥接网络：给 OpenList 容器版选网络用，同样异步补 */
+		function loadNetworks() {
+			return call(HUB, [ 'networks' ]).then(function(res) {
+				var list = [];
+
+				(res.text || '').split('\n').forEach(function(line) {
+					var i = line.indexOf('=');
+
+					if (i > 0 && line.substring(0, i).trim() === 'net')
+						list.push(line.substring(i + 1).trim());
+				});
+
+				if (list.join('|') !== (state.nets || []).join('|')) {
+					state.nets = list;
+					drawAll(true);
+				}
+			}).catch(function() {});
+		}
+
 		/* 1Panel 远端最新版本要出网，慢到几秒都可能，单独跑、不 await */
 		function loadLatest() {
 			return call(CTL_1P, [ 'latest' ]).then(function(res) {
@@ -1780,20 +1791,12 @@ return view.extend({
 
 		refresh(true);
 		loadDisks();
+		loadNetworks();
 		loadLatest();
 
-		/* 任务跑着时 5 秒一轮看进度；空闲时放宽到 10 秒 —— status 里要问
-		   docker、要 df，没必要那么勤。 */
-		var lastPoll = 0;
-
+		/* 5 秒一轮：任务进度、端口映射这些要跟上，status 已经做过裁剪
+		   （docker info 只问一次、1pctl 有 15 秒缓存），扛得住。 */
 		poll.add(function() {
-			var now = Date.now();
-
-			if (!busy(parseTask(state.hub.task).phase) && now - lastPoll < 10000)
-				return null;
-
-			lastPoll = now;
-
 			return refresh(false);
 		}, 5);
 

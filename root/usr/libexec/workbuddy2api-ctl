@@ -268,6 +268,10 @@ ver_ct() {
 # ---------------------------------------------------------------- 磁盘
 cmd_disks() {
 	df -k 2>/dev/null | awk 'NR>1 && $6 ~ /^\/mnt\// {print "disk=" $6 ":" $4}'
+	# /opt 多数机器上就在 overlay 里，df 不把它当挂载点单列，但一样能放数据
+	if [ -d /opt ] && [ -w /opt ]; then
+		echo "disk=/opt:$(df -k /opt 2>/dev/null | awk 'NR==2 {print $4}')"
+	fi
 	return 0
 }
 
@@ -843,9 +847,9 @@ cmd_install() {
 	[ -n "$dir" ] || dir="$DATADIR"
 
 	case "$dir" in
-		/mnt/*) ;;
+		/mnt/* | /opt/*) ;;
 		*)
-			echo "数据目录必须在 /mnt 下（当前：$dir）" >&2
+			echo "数据目录必须在 /mnt 或 /opt 下（当前：$dir）" >&2
 			echo "账号凭据与用量日志都写这里；放 overlay 会写满 flash，刷机也会丢。" >&2
 			return 2
 			;;
