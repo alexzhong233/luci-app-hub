@@ -6,8 +6,10 @@
 |---|---|
 | **qBittorrent** | 原生官方版 · 原生增强版（EE，反吸血） · 容器官方版 · 容器增强版 |
 | **OpenList** | openlist2（sbwml） · feeds 官方版 · 容器版 |
-| **1Panel** | 沿用原有 ctl，本页只做状态汇总和入口跳转 |
-| **WorkBuddy2API** | 同上 |
+| **1Panel** | 容器版 · 本地版 |
+| **WorkBuddy2API** | 本地 Rust · 本地 Python · 容器 Rust · 容器 Python |
+
+四个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
 
 ## 为什么合并
 
@@ -18,8 +20,9 @@ SIGTERM 时又会把内存里的配置写回文件——两者次序不固定，
 容器版没有这个问题：配置在 volume 里，端口在 compose 里，跟 init 脚本无关。把四种
 运行方式放在同一个页面并统一数据目录，切换时不用再记每种的路径和端口规则。
 
-1Panel 和 WorkBuddy2API 的逻辑没有重写，`1panel-ctl` / `workbuddy2api-ctl` 原样
-放进同一个包，页面直接调用——它们已经跑稳，为了"合并"再动一遍只会引入风险。
+1Panel 和 WorkBuddy2API 的**管理逻辑**没有重写，`1panel-ctl` / `workbuddy2api-ctl`
+原样放进同一个包、由新页面调用——它们已经跑稳，为了"合并"再动一遍只会引入风险。
+页面这边只是把它们原本分散的操作重新排进同一个界面。
 
 ## 数据目录
 

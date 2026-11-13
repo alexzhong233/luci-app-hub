@@ -75,6 +75,8 @@ function row(label, content) {
 var state = {
 	hub: {}, panel: {}, wb: {},
 	tab: 'qb',
+	pnMode: '',
+	draft: {},
 	out: '',
 	task: 'idle'
 };
@@ -125,11 +127,14 @@ return view.extend({
 
 		/* ---- 通用控件 ---- */
 
-		function selectBox(cur, options, onChange) {
+		function selectBox(cur, options, onChange, field) {
 			var sel = E('select', { 'class': 'cbi-input-select' }, options.map(function(o) {
 				return E('option', { 'value': o.value, 'selected': cur === o.value ? '' : null },
 					[ o.label ]);
 			}));
+
+			if (field)
+				sel.setAttribute('data-field', field);
 
 			sel.addEventListener('change', function() {
 				onChange(sel.value);
@@ -137,17 +142,39 @@ return view.extend({
 			return sel;
 		}
 
-		function textBox(cur, ph, onChange) {
+		function textBox(cur, ph, onChange, field) {
 			var inp = E('input', {
 				'class': 'cbi-input-text',
 				'value': cur || '',
 				'placeholder': ph || ''
 			});
 
+			if (field)
+				inp.setAttribute('data-field', field);
+
 			inp.addEventListener('change', function() {
 				onChange(inp.value.trim());
 			});
 			return inp;
+		}
+
+		/*
+		 * 页面每 5 秒重绘一次，直接重建 DOM 会把用户正在输入的内容冲掉。
+		 * 重绘前先把带 data-field 的输入框收集成草稿，渲染时优先取草稿。
+		 */
+		function collectDraft() {
+			var d = {};
+
+			body.querySelectorAll('[data-field]').forEach(function(el) {
+				d[el.getAttribute('data-field')] = el.value;
+			});
+			return d;
+		}
+
+		function val(field, fallback) {
+			var v = state.draft[field];
+
+			return (v !== undefined && v !== '') ? v : (fallback || '');
 		}
 
 		function btn(label, fn, cls) {
@@ -209,24 +236,24 @@ return view.extend({
 				])),
 
 				row('WebUI 端口', E('div', {}, [
-					textBox(st.qb_port, '8090', function(v) {
+					textBox(val('qb_port', st.qb_port), '8090', function(v) {
 						return saveCfg(sec, { port: v || '8090' });
-					}),
+					}, 'qb_port'),
 					flag(st.qb_port_busy) ? muted('  已在监听') : null,
 					note('默认 8090。避免用 8080 —— Nikki/mihomo 默认占这个端口。')
 				])),
 
 				row('BT 监听端口', E('div', {}, [
-					textBox(st.qb_bt_port, '21142', function(v) {
+					textBox(val('qb_bt', st.qb_bt_port), '21142', function(v) {
 						return saveCfg(sec, { bt_port: v || '21142' });
-					}),
+					}, 'qb_bt'),
 					note('需要在防火墙/端口映射里放行 TCP+UDP。')
 				])),
 
 				row('下载目录', E('div', {}, [
-					textBox(st.qb_downloads, '/mnt/sda1/movie', function(v) {
+					textBox(val('qb_dl', st.qb_downloads), '/mnt/sda1/movie', function(v) {
 						return saveCfg(sec, { downloads: v });
-					}),
+					}, 'qb_dl'),
 					note('容器版里映射为 /downloads。目录不存在会自动创建。')
 				])),
 
@@ -275,9 +302,9 @@ return view.extend({
 				])),
 
 				row('端口', E('div', {}, [
-					textBox(st.ol_port, '5244', function(v) {
+					textBox(val('ol_port', st.ol_port), '5244', function(v) {
 						return saveCfg(sec, { port: v || '5244' });
-					}),
+					}, 'ol_port'),
 					flag(st.ol_port_busy) ? muted('  已在监听') : null
 				])),
 
@@ -302,48 +329,174 @@ return view.extend({
 			]);
 		}
 
-		/* ---- 1Panel / WorkBuddy2API ---- */
+		/* ---- 1Panel ---- */
 
-		function simplePane(kind, st) {
-			var info = kind === 'pn'
-				? { title: '1Panel', ctl: CTL_1P, port: '10086', menu: 'NAS → 1Panel' }
-				: { title: 'WorkBuddy2API', ctl: CTL_WB, port: '8788', menu: '服务 → WorkBuddy2API' };
+		function pnPane(st) {
+			var mode = state.pnMode || (st.kind === 'native' ? 'native' : 'container');
+			var isC = mode === 'container';
+			var pk = isC ? 'container_' : 'native_';
+			var running = flag(st[isC ? 'container_running' : 'native_running']);
+			var port = val('pn_port', st[pk + 'port'] || st.port || '10086');
+			var user = val('pn_user', st[pk + 'username'] || st.username || '1panel');
+			var pass = state.draft.pn_pass || '';
+			var ent = val('pn_ent', st[pk + 'entrance'] || st.entrance || '');
+			var dir = val('pn_dir', st[pk + 'datadir'] || st.datadir || '/mnt/sda1/Configs/1Panel');
+			var img = val('pn_img', st.container_image || 'moelin/1panel:v2');
+			var rootp = val('pn_root', st.container_rootpath || '0');
 
-			var kv = st || {};
-			var port = kv.port || info.port;
-			var running = flag(kv.running);
+			var sub = E('div', { 'style': 'display:flex;gap:.4em;margin-bottom:.6em' }, [
+				btn('容器版', function() { state.pnMode = 'container'; drawBody(true); }, isC ? 'cbi-button-action' : 'cbi-button-neutral'),
+				btn('本地版', function() { state.pnMode = 'native'; drawBody(true); }, !isC ? 'cbi-button-action' : 'cbi-button-neutral')
+			]);
 
-			var host = state.hub.lanip || window.location.hostname;
-			var link = E('a', {
-				'href': 'http://' + host + ':' + port,
-				'target': '_blank',
-				'class': 'cbi-button cbi-button-action',
-				'style': 'display:inline-block;padding:.35em .9em;border-radius:4px'
-			}, [ '打开 ' + info.title ]);
+			var passInput = E('input', {
+				'class': 'cbi-input-text',
+				'type': 'password',
+				'value': pass,
+				'placeholder': '至少 8 位，仅首次安装用',
+				'data-field': 'pn_pass'
+			});
+			passInput.addEventListener('change', function() {
+				state.draft.pn_pass = passInput.value;
+			});
+
+			function args() {
+				return isC
+					? [ 'container', 'install', port, user, pass, ent, dir, String(rootp), img ]
+					: [ 'install', port, user, pass, ent, dir ];
+			}
+
+			function life(act) {
+				return run(CTL_1P, isC ? [ 'container', act ] : [ act ], '1Panel ' + act);
+			}
 
 			return E('div', {}, [
-				row('管理方式', E('div', {}, [
-					muted('沿用各自原有的 ctl 与页面，本页只做状态汇总和入口跳转。'),
-					note('详细设置请到「' + info.menu + '」页面。')
+				row('安装方式', E('div', {}, [ sub,
+					note(isC ? '容器版：docker compose 跑 moelin/1panel，数据挂载在 /mnt'
+						: '本地版：官方 install.sh 铺二进制，procd 托管，约 152MB 写在 overlay')
 				])),
 
 				row('状态', E('div', {}, [
 					badge(running, '运行中', '未运行'),
-					kv.kind ? muted('  · 当前：' + kv.kind) : null,
-					kv.version ? muted('  · 版本：' + kv.version) : null,
-					kv.datadir ? note('数据目录：' + kv.datadir) : null
+					muted('  当前：' + (st.kind || 'none')),
+					st.version ? muted('  · 版本 ' + st.version) : null,
+					flag(st.conflict) ? note('⚠ 两套同时存在，会抢同一端口和数据目录。') : null
 				])),
 
-				row('入口', E('div', {}, [
-					link,
-					muted('  端口 ' + port)
+				row('端口', textBox(port, '10086', function() {}, 'pn_port')),
+
+				row('账号', textBox(user, '1panel', function() {}, 'pn_user')),
+
+				row('密码', E('div', {}, [ passInput,
+					note('安装时写入面板数据库，之后改这里不会再生效，请到面板里改。')
+				])),
+
+				row('安全入口', E('div', {}, [ textBox(ent, '留空则自动生成', function() {}, 'pn_ent'),
+					note('面板 URL 的路径后缀，例如 /abcd1234。')
+				])),
+
+				row('数据目录', E('div', {}, [ textBox(dir, '/mnt/sda1/Configs/1Panel', function() {}, 'pn_dir'),
+					note('必须落在可写的挂载点上，否则安装会被拒绝（返回码 2）。')
+				])),
+
+				isC ? row('镜像', textBox(img, 'moelin/1panel:v2', function() {}, 'pn_img')) : null,
+
+				isC ? row('挂载 root', selectBox(String(rootp), [
+					{ value: '0', label: '否（推荐）' },
+					{ value: '1', label: '是（面板里可浏览整机文件）' }
+				], function() {}, 'pn_root')) : null,
+
+				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;margin-top:.8em' }, [
+					btn('安装', function() {
+						return run(CTL_1P, args(), '安装 1Panel');
+					}),
+					btn('更新', function() {
+						return run(CTL_1P, isC ? [ 'container', 'update' ] : [ 'update' ], '更新 1Panel');
+					}),
+					btn('启动', function() { return life('start'); }, 'cbi-button-positive'),
+					btn('停止', function() { return life('stop'); }, 'cbi-button-negative'),
+					btn('重启', function() { return life('restart'); }),
+					btn('日志', function() {
+						return run(CTL_1P, isC ? [ 'container', 'logs' ] : [ 'logs' ], '1Panel 日志');
+					}, 'cbi-button-neutral'),
+					btn('卸载', function() {
+						if (!confirm('确定卸载 1Panel？数据目录会保留。'))
+							return Promise.resolve();
+						return run(CTL_1P, isC ? [ 'container', 'remove' ] : [ 'remove' ], '卸载 1Panel');
+					}, 'cbi-button-reset')
+				]),
+
+				E('div', { 'style': 'margin-top:.6em' }, [
+					E('a', {
+						'href': 'http://' + (state.hub.lanip || window.location.hostname) + ':' + port,
+						'target': '_blank',
+						'class': 'cbi-button cbi-button-action',
+						'style': 'display:inline-block;padding:.35em .9em;border-radius:4px'
+					}, [ '打开面板' ])
+				])
+			]);
+		}
+
+		/* ---- WorkBuddy2API ---- */
+
+		function wbPane(st) {
+			var variant = val('wb_variant', st.variant || 'rust');
+			var port = val('wb_port', st.port || '8788');
+			var dir = val('wb_dir', st.datadir || '/mnt/sda1/Configs/workbuddy2api');
+			var running = flag(st.running);
+
+			function life(act) {
+				return run(CTL_WB, [ act, variant ], 'WorkBuddy2API ' + act);
+			}
+
+			return E('div', {}, [
+				row('安装方式', selectBox(variant, [
+					{ value: 'rust', label: '本地 · Rust（静态单文件，推荐）' },
+					{ value: 'python', label: '本地 · 原版 Python' },
+					{ value: 'rust-docker', label: '容器 · Rust（ghcr.io/ytjungle666）' },
+					{ value: 'python-docker', label: '容器 · 原版（ghcr.io/ardeyou）' }
+				], function() {}, 'wb_variant')),
+
+				row('状态', E('div', {}, [
+					badge(running, '运行中', '未运行'),
+					muted('  当前：' + (st.kind || 'none')),
+					st.version ? muted('  · 版本 ' + st.version) : null
+				])),
+
+				row('端口', textBox(port, '8788', function() {}, 'wb_port')),
+
+				row('数据目录', E('div', {}, [ textBox(dir, '/mnt/sda1/Configs/workbuddy2api', function() {}, 'wb_dir'),
+					note('accounts（每账号一个 JSON）与 usage（用量日志）都在这里。' +
+						'四种实现共用同一份数据，切换只换运行方式，账号和额度记录不动。')
 				])),
 
 				E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap;margin-top:.8em' }, [
-					btn('刷新状态', function() { return refresh(true); }),
-					btn('查看日志', function() {
-						return run(info.ctl, [ 'logs' ], info.title + ' 日志');
-					}, 'cbi-button-neutral')
+					btn('安装', function() {
+						return run(CTL_WB, [ 'install', variant, port, dir ], '安装 WorkBuddy2API');
+					}),
+					btn('更新', function() {
+						return run(CTL_WB, [ 'update', variant ], '更新 WorkBuddy2API');
+					}),
+					btn('启动', function() { return life('start'); }, 'cbi-button-positive'),
+					btn('停止', function() { return life('stop'); }, 'cbi-button-negative'),
+					btn('重启', function() { return life('restart'); }),
+					btn('日志', function() {
+						return run(CTL_WB, [ 'logs', variant ], 'WorkBuddy2API 日志');
+					}, 'cbi-button-neutral'),
+					btn('卸载', function() {
+						if (!confirm('确定卸载 ' + variant + '？数据目录会保留。'))
+							return Promise.resolve();
+						return run(CTL_WB, [ 'remove', variant ], '卸载');
+					}, 'cbi-button-reset')
+				]),
+
+				E('div', { 'style': 'margin-top:.6em' }, [
+					E('a', {
+						'href': 'http://' + (state.hub.lanip || window.location.hostname) + ':' + port,
+						'target': '_blank',
+						'class': 'cbi-button cbi-button-action',
+						'style': 'display:inline-block;padding:.35em .9em;border-radius:4px'
+					}, [ '打开页面' ])
 				])
 			]);
 		}
@@ -384,11 +537,14 @@ return view.extend({
 			var st = state.hub;
 			var node;
 
+			/* force = 切页签/操作完成，草稿失效；否则是从状态刷新重绘，保留输入 */
+			state.draft = force ? {} : collectDraft();
+
 			switch (state.tab) {
 			case 'qb': node = qbPane(st); break;
 			case 'ol': node = olPane(st); break;
-			case 'pn': node = simplePane('pn', state.panel); break;
-			case 'wb': node = simplePane('wb', state.wb); break;
+			case 'pn': node = pnPane(state.panel); break;
+			case 'wb': node = wbPane(state.wb); break;
 			default: node = E('div', {}, [ '未知页签' ]);
 			}
 
