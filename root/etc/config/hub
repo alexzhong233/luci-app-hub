@@ -13,3 +13,7 @@ config service 'openlist'
 	option variant 'openlist2'
 	option port '5244'
 	option network 'host'
+
+config service 'magpie'
+	option image 'ghcr.io/yetone/magpie:latest'
+	option web_port '3430'

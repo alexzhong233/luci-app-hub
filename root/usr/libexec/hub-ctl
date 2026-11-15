@@ -15,6 +15,9 @@
 #   openlist2  sbwml/luci-app-openlist2，数据 /etc/openlist2
 #   docker     容器版 openlistteam/openlist
 #
+# Magpie（AI 模型网关）
+#   docker     只有容器版 —— 它是 Go 单体，官方只发多架构镜像，没有 OpenWrt 包
+#
 # 数据目录优先级（按用户要求：优先 sda1，其次与 luci 版同位置）
 #   1. hub.<name>.datadir 显式指定
 #   2. /mnt/sda1 存在可写 → /mnt/sda1/Configs/services/<name>
@@ -29,6 +32,10 @@ OL_IMG="openlistteam/openlist:latest"
 
 QBT_CT="qbittorrent"
 OL_CT="openlist"
+MG_CT="magpie"
+
+# 3425 是 agent 连的网关端口（固定），3430 是浏览器控制台（页面里可改）
+MG_GW_PORT="3425"
 
 DATA_ROOT_DEFAULT="/mnt/sda1/Configs"
 DATA_ROOT_ALT="/opt/Configs"
@@ -1401,6 +1408,202 @@ ol_start() {
 
 ol_stop() { ol_stop_all; }
 
+# ================================================================ Magpie
+# 只有容器版：Go 单体，官方只发多架构镜像，没有 OpenWrt 包可编。
+#
+# 必须 host 网络：bridge 容器出网会撞 Nikki 的 prerouting 劫持（TCP 被
+# redirect 到 mihomo 后直接 RST），host 下它就是本机进程，由 Nikki 按域名
+# 分流 —— 海外 provider 走节点、国内 provider 直出，容器里不用配代理变量。
+mg_datadir() {
+	local d
+
+	d=$(cfg magpie.datadir)
+	[ -n "$d" ] && { echo "$d"; return; }
+	echo "$(data_root)/magpie"
+}
+
+mg_compose() { echo "$(mg_datadir)/docker-compose.yml"; }
+mg_image() { cfg_def magpie.image "$MG_IMG"; }
+mg_web_port() { cfg_def magpie.web_port 3430; }
+mg_web_key() { cfg magpie.web_key; }
+
+# 32 位十六进制。openssl 在 OpenWrt 上不一定装，退回 /dev/urandom
+mg_gen_key() {
+	local k
+
+	k=$(openssl rand -hex 16 2>/dev/null)
+	[ -n "$k" ] || k=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+	echo "$k"
+}
+
+# 容器里跑的是 uid 65532(nonroot)，bind mount 的目录不归它就起不来。
+# 数据盘是 exfat/vfat 时 chown 会静默失败（没有属主概念），所以不在这里挡，
+# 由 status 的 mg_owner_ok 告诉页面。
+mg_fix_owner() {
+	local d
+
+	d=$(mg_datadir)
+	mkdir -p "$d" || return 1
+	chown -R 65532:65532 "$d" 2>/dev/null
+	return 0
+}
+
+mg_compose_write() {
+	local f dir img key port
+
+	f=$(mg_compose)
+	dir=$(mg_datadir)
+	img=$(mg_image)
+	key=$(mg_web_key)
+	port=$(mg_web_port)
+
+	[ -n "$key" ] || return 1
+	mkdir -p "$dir" || return 1
+
+	{
+		echo "# 由 luci-app-hub 生成，修改会被覆盖。"
+		echo "services:"
+		echo "  $MG_CT:"
+		echo "    image: $(yaml_q "$img")"
+		echo "    container_name: $MG_CT"
+		echo "    # host：等同路由器本机进程，出网由 Nikki 按域名分流。"
+		echo "    # 换 bridge 会撞劫持，连不上任何 provider。"
+		echo "    network_mode: host"
+		echo "    environment:"
+		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
+		echo "      MAGPIE_WEB_KEY: $(yaml_q "$key")"
+		echo "      MAGPIE_PUBLIC_URL: $(yaml_q "http://$(lan_ip):$MG_GW_PORT")"
+		echo "    volumes:"
+		echo "      - $(yaml_q "$dir:/config")"
+		echo "    # 不带 web 子命令时只跑 serve（纯网关）；--no-open 是必需的，"
+		echo "    # 容器里没有浏览器"
+		echo "    command: [\"web\", \"--addr\", \"0.0.0.0:$port\", \"--no-open\"]"
+		echo "    restart: unless-stopped"
+	} >"$f" || return 1
+
+	chmod 600 "$f"
+	return 0
+}
+
+mg_worker_install() {
+	local key
+
+	set_phase "installing:容器版"
+
+	# 密钥要写进 compose，没有就先造一个落 UCI，之后重写都读同一个值
+	key=$(mg_web_key)
+	if [ -z "$key" ]; then
+		key=$(mg_gen_key)
+		save_cfg magpie "web_key=$key"
+	fi
+
+	mg_stop >/dev/null 2>&1
+	mkdir -p "$(mg_datadir)" || {
+		set_phase "error:建不了数据目录 $(mg_datadir)"
+		return 1
+	}
+	mg_compose_write || {
+		set_phase "error:写 compose 失败"
+		return 1
+	}
+	mg_fix_owner
+
+	echo "== 拉取镜像 $(mg_image)"
+	compose "$MG_CT" "$(mg_compose)" pull || echo "== pull 有告警，继续"
+
+	echo "== 启动"
+	compose "$MG_CT" "$(mg_compose)" up -d || {
+		set_phase "error:compose up 失败（看日志）"
+		return 1
+	}
+
+	# 容器启动时会建 config/ 等子目录，归属再修一次
+	mg_fix_owner
+
+	save_cfg magpie "variant=docker"
+	set_phase "done"
+	echo "== 完成"
+}
+
+mg_start() {
+	local key
+
+	key=$(mg_web_key)
+	if [ -z "$key" ]; then
+		key=$(mg_gen_key)
+		save_cfg magpie "web_key=$key"
+	fi
+
+	mg_fix_owner >/dev/null 2>&1
+	# 端口/密钥改过就靠重写让 compose 自己判断要不要重建
+	mg_compose_write >/dev/null 2>&1 || return 1
+	compose "$MG_CT" "$(mg_compose)" up -d
+}
+
+mg_stop() {
+	if [ -f "$(mg_compose)" ]; then
+		compose "$MG_CT" "$(mg_compose)" down >/dev/null 2>&1
+	else
+		docker stop "$MG_CT" >/dev/null 2>&1
+	fi
+	return 0
+}
+
+# 换一把控制台密钥。密钥在 compose 里，所以必须重建容器才生效。
+mg_rotate_key() {
+	local key
+
+	key=$(mg_gen_key)
+	save_cfg magpie "web_key=$key"
+	echo "新的控制台密钥：$key"
+
+	if [ "$(ct_state "$MG_CT")" = "running" ]; then
+		mg_stop >/dev/null 2>&1
+		mg_start >/dev/null 2>&1 && echo "已按新密钥重建容器"
+	fi
+	return 0
+}
+
+mg_status() {
+	local cstate running web_busy gw_busy owner d
+
+	cstate=$(ct_state "$MG_CT" 2>/dev/null)
+	d=$(mg_datadir)
+	running=0
+	web_busy=0
+	gw_busy=0
+
+	[ "$cstate" = "running" ] && running=1
+	port_listening "$(mg_web_port)" && web_busy=1
+	port_listening "$MG_GW_PORT" && gw_busy=1
+
+	echo "mg_image=$(mg_image)"
+	echo "mg_ct=$cstate"
+	echo "mg_running=$running"
+	echo "mg_web_port=$(mg_web_port)"
+	echo "mg_gw_port=$MG_GW_PORT"
+	echo "mg_web_busy=$web_busy"
+	echo "mg_gw_busy=$gw_busy"
+	echo "mg_datadir=$d"
+	echo "mg_web_key=$(mg_web_key)"
+	echo "mg_public=http://$(lan_ip):$MG_GW_PORT"
+
+	# chown 在 exfat 上会静默失败，页面据此提示
+	owner=$(stat -c %u "$d" 2>/dev/null)
+	if [ "$owner" = "65532" ]; then
+		echo "mg_owner_ok=1"
+	else
+		echo "mg_owner_ok=0"
+	fi
+
+	# providers.json 由 magpie 自己写，存在就说明配过 provider
+	if [ -f "$d/config/magpie/providers.json" ]; then
+		echo "mg_providers=1"
+	else
+		echo "mg_providers=0"
+	fi
+}
+
 ol_status() {
 	local v kind cstate running listen
 	v=$(ol_variant)
@@ -1457,6 +1660,7 @@ cmd_status() {
 
 	qb_status
 	ol_status
+	mg_status
 }
 
 cmd_install() {
@@ -1486,8 +1690,19 @@ cmd_install() {
 		esac
 		spawn_task "installing:$(ol_variant_label "$(ol_variant)")" "安装 OpenList" _worker_ol_install
 		;;
+	magpie)
+		# 只有容器版，没有变体可选
+		case "$v" in
+		"") ;;
+		*)
+			echo "用法：hub-ctl install magpie（只有容器版）" >&2
+			return 1
+			;;
+		esac
+		spawn_task "installing:容器版" "安装 Magpie" _worker_mg_install
+		;;
 	*)
-		echo "用法：hub-ctl install qbittorrent|openlist [变体]" >&2
+		echo "用法：hub-ctl install qbittorrent|openlist|magpie [变体]" >&2
 		return 1
 		;;
 	esac
@@ -1558,8 +1773,15 @@ cmd_lifecycle() {
 		sleep 1
 		ol_start
 		;;
+	magpie:start) mg_start ;;
+	magpie:stop) mg_stop ;;
+	magpie:restart)
+		mg_stop
+		sleep 1
+		mg_start
+		;;
 	*)
-		echo "用法：hub-ctl <start|stop|restart> qbittorrent|openlist" >&2
+		echo "用法：hub-ctl <start|stop|restart> qbittorrent|openlist|magpie" >&2
 		return 1
 		;;
 	esac
@@ -1606,8 +1828,13 @@ cmd_remove() {
 		esac
 		docker rmi "$(ol_image)" >/dev/null 2>&1
 		;;
+	magpie)
+		mg_stop
+		rm -f "$(mg_compose)"
+		docker rmi "$(mg_image)" >/dev/null 2>&1
+		;;
 	*)
-		echo "用法：hub-ctl remove qbittorrent|openlist" >&2
+		echo "用法：hub-ctl remove qbittorrent|openlist|magpie" >&2
 		return 1
 		;;
 	esac
@@ -1632,8 +1859,15 @@ cmd_logs() {
 			logread 2>/dev/null | grep -i openlist | tail -n "$n"
 		fi
 		;;
+	magpie)
+		if ct_present "$MG_CT"; then
+			docker logs --tail "$n" "$MG_CT" 2>&1
+		else
+			logread 2>/dev/null | grep -i magpie | tail -n "$n"
+		fi
+		;;
 	*)
-		echo "用法：hub-ctl logs qbittorrent|openlist [行数]" >&2
+		echo "用法：hub-ctl logs qbittorrent|openlist|magpie [行数]" >&2
 		return 1
 		;;
 	esac
@@ -1652,6 +1886,10 @@ _worker_qb_install)
 	;;
 _worker_ol_install)
 	ol_worker_install
+	exit $?
+	;;
+_worker_mg_install)
+	mg_worker_install
 	exit $?
 	;;
 esac
@@ -1675,6 +1913,7 @@ passwd)
 		;;
 	esac
 	;;
+mgkey) mg_rotate_key ;;
 task) cmd_task ;;
 *)
 	cat >&2 <<EOF
@@ -1682,12 +1921,13 @@ task) cmd_task ;;
 
   status                          输出所有服务的状态（key=value）
   networks                        可用的 docker 桥接网络
-  install <qbittorrent|openlist> [变体]  按指定（或当前）变体安装（后台任务）
+  install <qbittorrent|openlist|magpie> [变体]  按指定（或当前）变体安装（后台任务）
   start|stop|restart <svc>        启停
   setport <WebUI端口> [BT端口]     把端口存成设置值（写 UCI + qBittorrent.conf）
   remove <svc>                    卸载（保留数据目录）
   logs <svc> [行数]               日志
   passwd <svc> <新密码>           设置 WebUI / 管理员密码
+  mgkey                           换一把 Magpie 控制台密钥并重建容器
   task                            任务阶段与日志路径
 EOF
 	exit 1

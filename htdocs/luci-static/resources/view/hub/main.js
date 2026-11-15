@@ -28,7 +28,8 @@ var SVCS = [
 	{ id: 'qb', title: _('qBittorrent') },
 	{ id: 'ol', title: _('OpenList') },
 	{ id: 'pn', title: _('1Panel') },
-	{ id: 'wb', title: _('WorkBuddy2API') }
+	{ id: 'wb', title: _('WorkBuddy2API') },
+	{ id: 'mg', title: _('Magpie') }
 ];
 
 var QB_MODES = [
@@ -337,7 +338,7 @@ return view.extend({
 		}, [ _('（还没有执行任何操作）') ]);
 
 		/* 输入框跨重绘复用：轮询刷新不该把正在填的内容清掉 */
-		var inputs = { qb: {}, ol: {}, wb: {} };
+		var inputs = { qb: {}, ol: {}, wb: {}, mg: {} };
 
 		function once(store, key, factory) {
 			if (!store[key])
@@ -1686,6 +1687,8 @@ return view.extend({
 				w.kind, w.running, w.task, w.version, w.port, w.accounts, w.listening,
 				w.python_present, w.python_docker_present, w.rust_present, w.rust_docker_present,
 				w.python_version, w.python_docker_version, w.rust_version, w.rust_docker_version,
+				h.mg_image, h.mg_ct, h.mg_running, h.mg_web_port, h.mg_web_busy,
+				h.mg_gw_busy, h.mg_datadir, h.mg_web_key, h.mg_owner_ok, h.mg_providers,
 				state.latest
 			].join('|');
 		}
@@ -1733,6 +1736,7 @@ return view.extend({
 			case 'ol': contentWrap.appendChild(olView()); break;
 			case 'pn': contentWrap.appendChild(pnView()); break;
 			case 'wb': contentWrap.appendChild(wbView()); break;
+			case 'mg': contentWrap.appendChild(mgView()); break;
 			}
 		}
 
@@ -1749,6 +1753,196 @@ return view.extend({
 
 				drawAll(force);
 			});
+		}
+
+		/* ================================================================ Magpie */
+
+		/* 只有容器版，所以没有「运行方式」页签 —— 只有一个选项的页签比没有更烦人。
+		   结构仍是：状态卡 → 通用设置 → 操作区，和另外四个服务一致。 */
+
+		function mgView() {
+			var st = state.hub;
+			var frag = E('div');
+
+			frag.appendChild(mgHead(st));
+			frag.appendChild(mgShared(st));
+			frag.appendChild(mgOps(st));
+
+			return frag;
+		}
+
+		function mgHead(st) {
+			var running = flag(st.mg_running);
+			var webPort = st.mg_web_port || '3430';
+			var gwPort = st.mg_gw_port || '3425';
+			var key = st.mg_web_key || '';
+			var host = st.lanip || window.location.hostname;
+			var items = [];
+
+			items.push([ _('状态'), E('div', { 'class': 'hub-head' }, [
+				E('button', {
+					'class': 'btn cbi-button ' + (running ? 'cbi-button-success' : 'cbi-button-negative'),
+					'disabled': 'disabled',
+					'style': 'cursor:default;min-width:13rem;opacity:1'
+				}, [ running ? _('Magpie 正在运行') : _('Magpie 未运行') ]),
+				/* 控制台必须带密钥才进得去，裸 http://ip:3430 会 401 */
+				running && key ? E('a', {
+					'class': 'btn cbi-button cbi-button-action',
+					'href': 'http://' + host + ':' + webPort + '/?k=' + key,
+					'target': '_blank',
+					'rel': 'noopener'
+				}, [ _('打开控制台') ]) : ''
+			]) ]);
+
+			items.push([ _('镜像'), E('code', {}, [ st.mg_image || '—' ]) ]);
+
+			items.push([ _('网关地址'), E('span', {}, [
+				link(st.mg_public || ('http://' + host + ':' + gwPort)),
+				' ',
+				flag(st.mg_gw_busy) ? E('span', { 'class': 'label success' }, [ _('已监听') ])
+					: muted(_('未监听')),
+				muted('  ' + _('agent / 客户端填这个地址，再加一把网关密钥（控制台 Gateway 页生成）'))
+			]) ]);
+
+			items.push([ _('控制台'), E('span', {}, [
+				E('code', {}, [ host + ':' + webPort ]),
+				' ',
+				flag(st.mg_web_busy) ? E('span', { 'class': 'label success' }, [ _('已监听') ])
+					: muted(_('未监听'))
+			]) ]);
+
+			items.push([ _('provider'), flag(st.mg_providers)
+				? E('span', {}, [ _('已配置'), muted('  ' + _('去控制台的 Providers 页增删')) ])
+				: muted(_('还没配 —— 去控制台加一个 provider 才能用')) ]);
+
+			items.push([ _('数据目录'), E('code', {}, [ st.mg_datadir || '—' ]) ]);
+			items.push([ _('数据盘剩余'), mb(st.data_free_kb) ]);
+			items.push([ _('overlay 剩余'), mb(st.overlay_free_kb) ]);
+
+			if (flag(st.mg_ct) && !flag(st.mg_owner_ok))
+				items.push(alertBox(_('数据目录不属于 65532，容器写不进去（镜像里跑的是 nonroot）。'
+					+ '数据盘是 exfat/vfat 时 chown 不生效，得换 ext4。')));
+
+			if (flag(st.docker) && !flag(st.dockerroot_ok))
+				items.push(alertBox(_('Docker 数据目录在 ') + (st.dockerroot || 'overlay')
+					+ _('，镜像会吃 overlay 空间，刷机后还会一起没掉。')));
+
+			items.push(taskBox(st.task));
+
+			return statusCard(items);
+		}
+
+		function mgShared(st) {
+			var running = flag(st.mg_running);
+
+			var fPort = once(inputs.mg, 'port', function() {
+				return textInput(st.mg_web_port || '3430', '3430');
+			});
+			bindOnce(fPort, 'change', function() {
+				saveCfg('magpie', { web_port: fPort.value.trim() || '3430' }).then(function() {
+					return running ? run(HUB, [ 'restart', 'magpie' ], _('按新端口重启')) : null;
+				});
+			});
+
+			var fDir = once(inputs.mg, 'dir', function() {
+				return textInput(st.mg_datadir || '', '/mnt/sda1/Configs/magpie');
+			});
+			bindOnce(fDir, 'change', function() {
+				saveCfg('magpie', { datadir: fDir.value.trim() }).then(function() {
+					return running ? run(HUB, [ 'restart', 'magpie' ], _('按新数据目录重启')) : null;
+				});
+			});
+
+			var rows = [
+				E('label', {}, [ _('控制台端口') ]),
+				E('div', {}, [ fPort, muted(' ' + _('浏览器开控制台用这个。网关端口固定 3425 —— '
+					+ '那个地址会写进给 agent 的配置，改了客户端要跟着改。')) ]),
+
+				E('label', {}, [ _('数据目录') ]),
+				E('div', {}, [
+					diskSelect(state.disks, 'Configs/magpie', fDir),
+					E('div', { 'style': 'margin:.35rem 0' }, [ fDir ]),
+					muted(_('providers、登录态、网关密钥、用量都在这里（容器内挂成 /config）。'
+						+ '改路径只影响之后的启动，旧目录的数据不会自动搬。'))
+				]),
+
+				E('label', {}, [ _('控制台密钥') ]),
+				E('div', {}, [
+					E('code', { 'style': 'word-break:break-all' },
+						[ st.mg_web_key || _('（安装时生成）') ]),
+					' ',
+					button(_('重新生成'), function() {
+						return run(HUB, [ 'mgkey' ], _('重新生成控制台密钥'));
+					}, { confirm: _('换密钥后，已经登录的浏览器会掉线。确定？') })
+				])
+			];
+
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('通用设置') ]),
+				E('div', { 'class': 'cbi-map-descr' }, [
+					_('Magpie 只有容器版：Go 单体，官方只发多架构镜像（arm64 / amd64），没有 OpenWrt 包可编。'),
+					E('br'),
+					_('走 host 网络，出网交给 Nikki 按域名分流 —— 海外 provider 走节点、国内 provider 直出，'
+						+ '所以容器里没有任何代理变量。换成 bridge 会撞上劫持，连不上任何 provider。')
+				]),
+				E('div', { 'class': 'hub-form', 'style': 'margin-top:1rem' }, rows)
+			]);
+		}
+
+		function mgOps(st) {
+			var running = flag(st.mg_running);
+			var present = !!st.mg_ct;
+			var inFlight = busy(parseTask(st.task).phase);
+			var body = [];
+
+			if (!present) {
+				body.push(E('h3', {}, [ _('安装（容器版）') ]));
+				body.push(E('div', { 'class': 'cbi-map-descr' }, [
+					_('拉 ghcr.io/yetone/magpie 的 arm64 镜像（压缩约 68 MB，解开两百多 MB，'
+						+ '落在 Docker 数据目录里）。数据写在上面的目录，卸载不删。'),
+					E('br'),
+					_('国内拉 ghcr 经常失败 —— 报 TLS handshake timeout 就是没拉下来，'
+						+ '要先给 dockerd 配代理再重试。')
+				]));
+
+				body.push(E('div', { 'class': 'hub-actions', 'style': 'margin-top:1rem' }, [
+					button(_('安装 Magpie'), function() {
+						return run(HUB, [ 'install', 'magpie' ], _('安装 Magpie'));
+					}, { primary: true, disabled: inFlight })
+				]));
+			}
+			else {
+				body.push(E('h3', {}, [ _('操作') ]));
+
+				body.push(E('div', { 'class': 'hub-actions' }, [
+					running
+						? button(_('停止'), function() {
+							return run(HUB, [ 'stop', 'magpie' ], _('停止 Magpie'));
+						}, { disabled: inFlight })
+						: button(_('启动'), function() {
+							return run(HUB, [ 'start', 'magpie' ], _('启动 Magpie'));
+						}, { primary: true, disabled: inFlight }),
+					button(_('重启'), function() {
+						return run(HUB, [ 'restart', 'magpie' ], _('重启 Magpie'));
+					}, { disabled: inFlight }),
+					button(_('查看日志'), function() {
+						return run(HUB, [ 'logs', 'magpie', '80' ], _('查看日志'));
+					}, { disabled: inFlight }),
+					button(_('卸载'), function() {
+						return run(HUB, [ 'remove', 'magpie' ], _('卸载 Magpie'));
+					}, { danger: true, disabled: inFlight,
+						confirm: _('卸载会删容器和镜像，数据目录保留。确定？') })
+				]));
+
+				body.push(E('div', { 'class': 'cbi-map-descr' }, [
+					_('再点一次「安装」等于重拉镜像并重建容器，providers 和密钥都不丢。'),
+					E('br'),
+					_('客户端接入：ANTHROPIC_BASE_URL / OPENAI_BASE_URL 都填网关地址，'
+						+ 'key 用控制台里生成的 sk-magpie-…')
+				]));
+			}
+
+			return E('div', { 'class': 'cbi-section' }, body);
 		}
 
 		/* 数据目录候选：只是 df，几百毫秒，但不能挡首屏 */

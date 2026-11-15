@@ -1,6 +1,6 @@
 # luci-app-hub
 
-把四个常用服务收进一个 LuCI 页面，页签切换。
+把五个服务收进一个 LuCI 页面，页签切换。
 
 | 页签 | 运行方式 |
 |---|---|
@@ -8,8 +8,9 @@
 | **OpenList** | openlist2（sbwml，运行时下载预编译包） · feeds 官方版 · 容器版 |
 | **1Panel** | 容器版 · 本地版 |
 | **WorkBuddy2API** | 本地 Rust · 本地 Python · 容器 Rust · 容器 Python |
+| **Magpie** | 容器版（AI 模型网关，只有这一种） |
 
-四个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
+五个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
 
 版式沿用 `luci-app-1panel` 与 `luci-app-workbuddy2api` 原来那套。每个服务都是同一结构：
 
@@ -23,6 +24,9 @@
 
 **运行方式一律用页签，不用下拉框**：qBittorrent 4 个、OpenList 3 个、1Panel 2 个、
 WorkBuddy2API 4 个。通用设置常驻，装完也不消失，改端口、改数据目录随时可以。
+
+Magpie 是唯一例外：它只有容器版（Go 单体，官方只发多架构镜像，没有 OpenWrt 包），
+所以没有方式页签 —— 只有一个选项的页签比没有更烦人。其余结构完全一致。
 
 用 CSS Grid 而不是 `<table>` / `cbi-value`，是因为 Argon、Aurora 这类主题对 `th`/`td` 和
 `.cbi-value-title` 有高特异性的 `!important` 规则，会把表头和数据行拆成不同的盒模型，
@@ -176,6 +180,8 @@ uci commit dockerd
 | OpenList | 5244 | |
 | 1Panel | 10086 | 沿用原有配置 |
 | WorkBuddy2API | 8788 | 沿用原有配置 |
+| Magpie 网关 | 3425 | agent / 客户端填这个，**固定不可改**（会写进给 agent 的配置） |
+| Magpie 控制台 | 3430 | 浏览器打开，链接必须带 `?k=<密钥>` |
 
 怎么改：
 
@@ -207,6 +213,24 @@ uci commit dockerd
 （容器版是 `docker exec openlist ./openlist admin set`），直接写库，不用重启。
 
 密码通过 `fs.exec` 的环境参数传（`HUB_PASS`），argv 里只有 `-`，`ps` 看不到明文。
+
+## Magpie 为什么必须是 host 网络
+
+它是唯一一个**必须** host 的服务，不是省事而是唯一可行：
+
+- bridge 容器出网会走 docker 的 NAT，但包在 PREROUTING 就被 Nikki 劫持到 mihomo 的
+  `:7891`，那个端口不认 docker 网段，直接 RST —— 表现是连任何 provider 都
+  `Connection refused`（和 twitch-drops-miner 同一个坑）。
+- host 网络下容器等同路由器本机进程，Nikki 按域名分流：海外 provider 走节点、
+  国内 provider（DeepSeek / Kimi / GLM / 通义 / 火山 / 硅基流动）直出。
+  所以容器里**一行代理变量都不用配**。
+
+镜像压缩约 68 MB，解开两百多 MB，落在 Docker 的数据目录；`/config` 挂到
+`<数据目录>`（默认 `/mnt/sda1/Configs/magpie`），providers、登录态、网关密钥、
+用量都在里面，卸载不删、刷机不丢。
+
+容器内跑的是 uid 65532（nonroot），所以数据目录会 `chown -R 65532:65532`。
+数据盘是 ext4 才有效；exfat/vfat 没有属主概念，chown 静默失败，页面会报警。
 
 ## openlist2 是怎么装的
 

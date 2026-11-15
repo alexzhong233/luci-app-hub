@@ -1,5 +1,11 @@
 # magpie —— 路由器上的 AI 模型网关（Docker）
 
+> **已被 `luci-app-hub` 的 Magpie 页签取代。**
+> 装过 hub 的机器请用页签里的安装/启停/日志，别再跑这个脚本 ——
+> 两套写的是同一个 compose（`<数据目录>/docker-compose.yml`），
+> 交替执行只会互相覆盖、白折腾。这里的脚本只留给**没有装 hub** 的机器，
+> 或者当 hub 的 Magpie 页签出问题时的排查参照。
+
 [magpie](https://github.com/yetone/magpie) 把 **OpenAI / Anthropic / Gemini** 三套协议统一到一个端口，
 再叠一层多 provider、多账号的额度故障切换。装在路由器上，局域网里所有 agent
 （Claude Code、Codex、Cherry Studio、OpenWebUI、手机）共用一个出口和一池 key；
