@@ -91,11 +91,12 @@ cat <<'EOF'
 
 装好了。浏览器 Ctrl+Shift+R 强刷，菜单：服务 → 服务合集
 
-四个页签：
+五个服务：
   qBittorrent   原生官方版 / 原生增强版 / 容器官方版 / 容器增强版
   OpenList      openlist2 / feeds 官方版 / 容器版
   1Panel        沿用原有 ctl，这里只做状态与入口
-  WorkBuddy2API 同上
+  WorkBuddy2API 本地/容器 × 原版/社区版，四个页签
+  Magpie        host 网络网关
 
 命令行：
   /usr/libexec/hub-ctl status
@@ -103,6 +104,6 @@ cat <<'EOF'
   /usr/libexec/hub-ctl start|stop|restart qbittorrent|openlist
   /usr/libexec/hub-ctl logs qbittorrent 40
 
-数据目录优先级：UCI 显式指定 > /mnt/sda1/Configs/services/<svc> > 原生位置
+数据目录优先级：UCI 显式指定 > /mnt/sda1/Configs/<服务名> > /opt/Configs/<服务名> > 原生位置
 （/etc/qBittorrent、/etc/openlist2）。切换运行方式不会动数据。
 EOF
