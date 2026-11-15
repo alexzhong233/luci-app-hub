@@ -116,6 +116,16 @@ cd /mnt/sda1/Configs/magpie && docker compose down
 # 数据和配置在卷里，要彻底清就 rm -rf /mnt/sda1/Configs/magpie
 ```
 
+## 另一个：清理 Ravomi/luci-app-magpie 的残余
+
+如果之前试过那个第三方 LuCI 包（`curl .../Ravomi/luci-app-magpie/install.sh | sh`），
+它在 apk 系统上是用 `tar -C / -xzf` 直接铺文件，包管理器不知道，`apk del` 删不掉：
+
+```sh
+sh cleanup.sh --check    # 只看：列出残余 + 体检 rpcd / LuCI / workbuddy2api
+sh cleanup.sh            # 清理（先把 /etc/magpie 备份到 /root 再删）
+```
+
 ## 还没做
 
 并进 `luci-app-hub` 的页面（第五个页签：状态 / 端口 / 网关密钥 / 启停 / 日志）。
