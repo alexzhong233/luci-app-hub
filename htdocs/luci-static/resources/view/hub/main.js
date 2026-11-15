@@ -14,7 +14,7 @@
  *   qBittorrent   原生·官方版 / 原生·增强版 / 容器·官方版 / 容器·增强版
  *   OpenList      openlist2 / feeds 官方版 / 容器版
  *   1Panel        容器安装 / 本地安装
- *   WorkBuddy2API 本地·原版 / 容器·原版 / 本地·Rust / 容器·Rust
+ *   WorkBuddy2API 本地·Python / 容器·Python
  *
  * 不用 <table> 也不用 cbi-value：Argon/Aurora 这类主题对 th/td 和
  * .cbi-value-title 有高特异性 !important 规则，会把表头和数据行拆成不同盒模型。
@@ -115,54 +115,31 @@ var PN_MODES = [
 	{ id: 'native', title: _('本地安装') }
 ];
 
-/* WorkBuddy2API 的四套实现，顺序与原来那个页面一致 */
+/* WorkBuddy2API 的两种装法，顺序与它自己那个页面一致 */
 var WB_MODES = [
 	{
 		id: 'python',
-		title: _('本地·原版'),
-		how: _('官方 OpenWrt 包（apk/ipk），Python 实现'),
+		title: _('本地·Python'),
+		how: _('上游 OpenWrt 包（apk/ipk），Python 实现'),
 		notes: [
 			_('procd 托管 python3 -m wb_proxy，参数全部走 /etc/config/workbuddy2api。'),
 			_('会连带装 python3 等依赖，约 15MB 落在 overlay。'),
 			_('网关地址 http://<路由器IP>:<端口>/v1，看板在根路径。')
 		],
 		fieldLabel: _('版本'),
-		fieldHint: _('留空 = 上游最新 release，例如 v2.0.7')
+		fieldHint: _('留空 = 上游最新 release，例如 v2.2.0')
 	},
 	{
 		id: 'python-docker',
-		title: _('容器·原版'),
-		how: _('官方镜像 ghcr.io/ardeyouxipianyi/workbuddy2api-hub'),
+		title: _('容器·Python'),
+		how: _('上游镜像 ghcr.io/m-strange/workbuddy2api-hub'),
 		notes: [
 			_('docker compose 起 wb-proxy，host 网络，容器内端口就是宿主端口。'),
 			_('账号挂 /app/accounts、用量挂 /app/usage，都指向数据目录下的同一份。'),
-			_('不占 overlay，镜像约 200MB 落在 docker 数据盘。')
+			_('不占 overlay，镜像约 100MB 落在 docker 数据盘。')
 		],
 		fieldLabel: _('镜像标签'),
-		fieldHint: _('留空 = 上游最新，例如 v2.0.7')
-	},
-	{
-		id: 'rust',
-		title: _('本地·Rust'),
-		how: _('Tjungle666 的 Rust 重写分支，单文件静态 musl 二进制'),
-		notes: [
-			_('无 Python 运行时依赖，约 20MB 落在 overlay，procd 托管 /usr/bin/wb-backend。'),
-			_('上游现在只有 tag 没有 release 资产，ctl 会自动从同版本镜像里把二进制抠出来。'),
-			_('功能对齐上游 v2.0.1，面板与 API 路径一致。')
-		],
-		fieldLabel: _('版本'),
-		fieldHint: _('留空 = 上游最新 tag，例如 v2.0.1.2')
-	},
-	{
-		id: 'rust-docker',
-		title: _('容器·Rust'),
-		how: _('Rust 版镜像 ghcr.io/ytjungle666/workbuddy2api-hub'),
-		notes: [
-			_('docker compose 起 wb-proxy，host 网络，整个数据目录挂到容器的 /data。'),
-			_('镜像自带的多架构产物，arm64 可用；不占 overlay。')
-		],
-		fieldLabel: _('镜像标签'),
-		fieldHint: _('留空 = 上游最新，例如 2.0.1.2（镜像标签不带 v）')
+		fieldHint: _('留空 = 上游最新，例如 v2.2.0')
 	}
 ];
 
@@ -1375,8 +1352,26 @@ return view.extend({
 
 		function wbVersion(st, id) { return wbF(st, id, 'version') || ''; }
 
-		function wbLatest(st, id) {
-			return String(id).indexOf('python') === 0 ? (st.latest_python || '') : (st.latest_rust || '');
+		function wbLatest(st) {
+			return st.latest_python || '';
+		}
+
+		/* 遗留的 Rust 版还认得出来，但已经不能装、不能更新 */
+		function wbTitle(kind) {
+			var m = null;
+
+			WB_MODES.forEach(function(x) { if (x.id === kind) m = x; });
+
+			if (m)
+				return m.title;
+
+			if (kind === 'rust')
+				return _('本地·Rust（已停更）');
+
+			if (kind === 'rust-docker')
+				return _('容器·Rust（已停更）');
+
+			return '';
 		}
 
 		function wbHead(st) {
@@ -1386,7 +1381,7 @@ return view.extend({
 			var label = kind === 'none'
 				? _('WorkBuddy2API 未安装')
 				: (running ? _('WorkBuddy2API 正在运行（%s）') : _('WorkBuddy2API 已停止（%s）'))
-					.format(modeOf(WB_MODES, kind).title);
+					.format(wbTitle(kind));
 
 			items.push([ _('状态'), E('div', { 'class': 'hub-head' }, [
 				E('button', {
@@ -1402,7 +1397,7 @@ return view.extend({
 
 			if (kind !== 'none') {
 				var cur = st.version || '';
-				var newv = wbLatest(st, kind);
+				var newv = flag(st.legacy) ? '' : wbLatest(st);
 				var cell = [ E('code', {}, [ cur ? 'v' + vnum(cur) : '—' ]) ];
 
 				if (newv && cur && vnum(newv) !== vnum(cur))
@@ -1410,7 +1405,7 @@ return view.extend({
 						[ _('有新版本 %s').format(newv) ]));
 				else if (newv && cur)
 					cell.push(muted(' ' + _('（已是最新）')));
-				else
+				else if (!flag(st.legacy))
 					cell.push(muted(' ' + _('（点下面的「检查更新」查上游）')));
 
 				items.push([ _('已装版本'), cell ]);
@@ -1429,7 +1424,7 @@ return view.extend({
 			items.push([ _('数据目录'), E('code', {}, [ st.datadir || '—' ]) ]);
 			items.push([ _('账号数'), [
 				E('code', {}, [ String(int(st.accounts)) ]),
-				muted(' ' + _('个 JSON（在 accounts/ 下，四版共用）'))
+				muted(' ' + _('个 JSON（在 accounts/ 下，两种装法共用）'))
 			] ]);
 			items.push([ _('用量体积'), mb(st.usagesize_kb) ]);
 			items.push([ _('数据盘剩余'), mb(st.data_free_kb) ]);
@@ -1438,12 +1433,18 @@ return view.extend({
 			if (flag(st.docker))
 				items.push([ _('Docker 剩余'), mb(st.docker_free_kb) ]);
 
+			if (flag(st.legacy))
+				items.push([ _('注意'), E('div', { 'class': 'hub-warn' }, [
+					wbTitle(flag(st.rust_present) ? 'rust' : 'rust-docker'),
+					_(' 是已停更的版本（上游删库），只能停用或卸载，换装下面的 Python 版。')
+				]) ]);
+
 			items.push(taskBox(st.task));
 
 			return statusCard(items);
 		}
 
-		/* 四个版本共用端口与数据目录，和原页面一样单独一栏；装完也保留 */
+		/* 两种装法共用端口与数据目录，和它自己的页面一样单独一栏；装完也保留 */
 		function wbShared(st) {
 			var fPort = once(inputs.wb, 'port', function() {
 				return textInput(st.port || '8788', '8788');
@@ -1456,7 +1457,7 @@ return view.extend({
 			return E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, [ _('通用设置') ]),
 				E('div', { 'class': 'cbi-map-descr' }, [
-					_('四个版本共用同一个数据目录和端口：accounts/ 里每个账号一个 JSON，usage/ 里是用量日志。'),
+					_('两种装法共用同一个数据目录和端口：accounts/ 里每个账号一个 JSON，usage/ 里是用量日志。'),
 					E('br'),
 					_('换实现只是换运行方式，账号和额度记录原地不动。'),
 					_('这两项在安装时生效：已装的话改完先卸载再装，或直接点「重启」让配置重新生成。')
@@ -1467,7 +1468,7 @@ return view.extend({
 					E('div', {}, [
 						diskSelect(state.disksWb, 'Configs/workbuddy2api', fDir),
 						E('div', { 'style': 'margin:.35rem 0' }, [ fDir ]),
-						muted(' ' + _('必须在 /mnt 下，账号凭据和用量都写这里'))
+						muted(' ' + _('必须在 /mnt 或 /opt 下，账号凭据和用量都写这里'))
 					])
 				])
 			]);
@@ -1477,7 +1478,7 @@ return view.extend({
 			var inFlight = busy(parseTask(st.task).phase);
 			var running = wbRunningOf(st, mode.id);
 			var cur = wbVersion(st, mode.id);
-			var newv = wbLatest(st, mode.id);
+			var newv = flag(st.legacy) ? '' : wbLatest(st);
 			var canUpdate = newv && cur && vnum(newv) !== vnum(cur);
 			var ops = [];
 
@@ -1531,8 +1532,6 @@ return view.extend({
 			if (mode.id.indexOf('docker') > 0)
 				info.push(E('div', {}, [ _('容器'), ': ', E('code', {}, [ 'wb-proxy' ]),
 					muted(' ' + _('（host 网络，compose 文件在数据目录下）')) ]));
-			else if (mode.id === 'rust')
-				info.push(E('div', {}, [ _('程序'), ': ', E('code', {}, [ '/usr/bin/wb-backend' ]) ]));
 			else
 				info.push(E('div', {}, [ _('程序'), ': ', E('code', {}, [ '/usr/lib/workbuddy2api' ]),
 					muted(' ' + _('（官方包，apk/opkg 管理）')) ]));
@@ -1555,6 +1554,9 @@ return view.extend({
 					other = m.id;
 			});
 
+			if (!other && flag(st.legacy))
+				other = 'legacy';
+
 			var blocked = !!other;
 			var fTag = E('input', {
 				'type': 'text', 'class': 'cbi-input-text', 'placeholder': mode.fieldHint
@@ -1565,9 +1567,9 @@ return view.extend({
 					var fPort = inputs.wb.port;
 					var fDir = inputs.wb.dir;
 
-					if (fDir.value.indexOf('/mnt/') !== 0) {
+					if (fDir.value.indexOf('/mnt/') !== 0 && fDir.value.indexOf('/opt/') !== 0) {
 						ui.addNotification(null, E('p', {}, [
-							_('数据目录必须在 /mnt 下：账号凭据、用量日志、容器数据都写这里')
+							_('数据目录必须在 /mnt 或 /opt 下：账号凭据、用量日志、容器数据都写这里')
 						]), 'warning');
 						return;
 					}
@@ -1587,14 +1589,16 @@ return view.extend({
 			];
 
 			if (blocked) {
-				var om = modeOf(WB_MODES, other);
+				var oname = other === 'legacy'
+					? wbTitle(flag(st.rust_present) ? 'rust' : 'rust-docker')
+					: modeOf(WB_MODES, other).title;
+				var ohint = other === 'legacy'
+					? _('它是已停更的 Rust 版，先卸掉（命令行 workbuddy2api-ctl remove rust 也行）再装新的。')
+					: _('二选一：同一时刻只能跑一个实现，装新的之前请先到「%s」页签把它卸载。').format(oname);
 
 				body.push(alertBox(E('div', {}, [
-					E('strong', {}, [ _('已经装了「%s」').format(om.title) ]),
-					E('div', { 'style': 'margin-top:.3rem' }, [
-						_('四选一：同一时刻只能跑一个实现，装新的之前请先到「%s」页签把它卸载。')
-							.format(om.title)
-					])
+					E('strong', {}, [ _('已经装了「%s」').format(oname) ]),
+					E('div', { 'style': 'margin-top:.3rem' }, [ ohint ])
 				])));
 			}
 
@@ -1723,8 +1727,10 @@ return view.extend({
 
 			if (state.svc === 'wb' && !state.pinned.wb) {
 				var kind = state.wb.kind;
+				var hit = false;
 
-				if (kind && kind !== 'none')
+				WB_MODES.forEach(function(m) { if (m.id === kind) hit = true; });
+				if (hit)
 					state.mode.wb = kind;
 			}
 
@@ -2008,10 +2014,10 @@ return view.extend({
 			E('style', {}, [ CSS ]),
 			E('h2', {}, [ _('服务合集') ]),
 			E('div', { 'class': 'cbi-map-descr' }, [
-				_('qBittorrent、OpenList、1Panel、WorkBuddy2API 收在一个页面里。'),
+				_('qBittorrent、OpenList、1Panel、WorkBuddy2API、Magpie 收在一个页面里。'),
 				E('br'),
 				_('每个服务都是「状态 → 通用设置 → 方式页签 → 安装/操作」：'),
-				_('qBittorrent 四种运行方式、OpenList 三种、1Panel 两种、WorkBuddy2API 四种，全部用页签切换。')
+				_('qBittorrent 四种运行方式、OpenList 三种、1Panel 两种、WorkBuddy2API 两种，全部用页签切换。')
 			]),
 			svcTabWrap,
 			contentWrap,
