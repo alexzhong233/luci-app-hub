@@ -1843,16 +1843,27 @@ return view.extend({
 
 		/* ================================================================ Magpie */
 
-		/* 只有容器版，所以没有「运行方式」页签 —— 只有一个选项的页签比没有更烦人。
-		   结构仍是：状态卡 → 通用设置 → 操作区，和另外四个服务一致。 */
+		/* Magpie 只有容器版，但页签照样给一个：「容器版」这一栏就是安装/运维的入口，
+		   和另外四个服务的版式统一。装了之后同一栏位切换成操作区，入口不会消失
+		   （以前装完只剩「操作」，想重拉镜像得敲命令行）。
+		   镜像是个配置项（magpie.image），安装栏里可以直接改 tag。 */
+
+		var MG_MODES = [ { id: 'docker', title: _('容器版（host 网络）') } ];
 
 		function mgView() {
 			var st = state.hub;
+			var present = !!st.mg_ct;
 			var frag = E('div');
 
 			frag.appendChild(mgHead(st));
 			frag.appendChild(mgShared(st));
-			frag.appendChild(mgOps(st));
+			frag.appendChild(modeTabs(MG_MODES, 'docker', function() {
+				state.sig = '';
+				drawAll(true);
+			}, function(m) {
+				return m.id === 'docker' && present ? _('（已装）') : '';
+			}));
+			frag.appendChild(E('div', {}, [ present ? mgOps(st) : mgInstall(st) ]));
 
 			return frag;
 		}
@@ -1975,32 +1986,53 @@ return view.extend({
 			]);
 		}
 
-		function mgOps(st) {
-			var running = flag(st.mg_running);
-			var present = !!st.mg_ct;
+		function mgInstall(st) {
 			var inFlight = busy(parseTask(st.task).phase);
-			var body = [];
 
-			if (!present) {
-				body.push(E('h3', {}, [ _('安装（容器版）') ]));
-				body.push(E('div', { 'class': 'cbi-map-descr' }, [
+			var fImg = once(inputs.mg, 'image', function() {
+				return textInput(st.mg_image || 'ghcr.io/yetone/magpie:latest',
+					'ghcr.io/yetone/magpie:latest');
+			});
+			bindOnce(fImg, 'change', function() {
+				return saveCfg('magpie', { image: fImg.value.trim() });
+			});
+
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('安装（容器版）') ]),
+				E('div', { 'class': 'cbi-map-descr' }, [
 					_('拉 ghcr.io/yetone/magpie 的 arm64 镜像（压缩约 68 MB，解开两百多 MB，'
 						+ '落在 Docker 数据目录里）。数据写在上面的目录，卸载不删。'),
 					E('br'),
 					_('国内拉 ghcr 经常失败 —— 报 TLS handshake timeout 就是没拉下来，'
-						+ '要先给 dockerd 配代理再重试。')
-				]));
+						+ '要先给 dockerd 配代理再重试。'),
+					E('br'),
+					_('端口、数据目录、控制台密钥都在上面「通用设置」里，装完也能改。')
+				]),
 
-				body.push(E('div', { 'class': 'hub-actions', 'style': 'margin-top:1rem' }, [
+				E('div', { 'class': 'hub-form', 'style': 'margin-top:1rem' }, [
+					E('label', {}, [ _('镜像') ]),
+					E('div', {}, [
+						fImg,
+						muted(' ' + _('默认 ghcr.io/yetone/magpie:latest；改 tag 会影响下次安装/重装'))
+					])
+				]),
+
+				E('div', { 'class': 'hub-actions', 'style': 'margin-top:1rem' }, [
 					button(_('安装 Magpie'), function() {
 						return run(HUB, [ 'install', 'magpie' ], _('安装 Magpie'));
 					}, { primary: true, disabled: inFlight })
-				]));
-			}
-			else {
-				body.push(E('h3', {}, [ _('操作') ]));
+				])
+			]);
+		}
 
-				body.push(E('div', { 'class': 'hub-actions' }, [
+		function mgOps(st) {
+			var running = flag(st.mg_running);
+			var inFlight = busy(parseTask(st.task).phase);
+
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('操作') ]),
+
+				E('div', { 'class': 'hub-actions' }, [
 					running
 						? button(_('停止'), function() {
 							return run(HUB, [ 'stop', 'magpie' ], _('停止 Magpie'));
@@ -2011,6 +2043,10 @@ return view.extend({
 					button(_('重启'), function() {
 						return run(HUB, [ 'restart', 'magpie' ], _('重启 Magpie'));
 					}, { disabled: inFlight }),
+					button(_('重装镜像'), function() {
+						return run(HUB, [ 'install', 'magpie' ], _('重拉镜像并重建容器'));
+					}, { disabled: inFlight,
+						confirm: _('会重新拉一次镜像并重建容器，providers、登录态和密钥都不丢。继续？') }),
 					button(_('查看日志'), function() {
 						return run(HUB, [ 'logs', 'magpie', '80' ], _('查看日志'));
 					}, { disabled: inFlight }),
@@ -2018,17 +2054,15 @@ return view.extend({
 						return run(HUB, [ 'remove', 'magpie' ], _('卸载 Magpie'));
 					}, { danger: true, disabled: inFlight,
 						confirm: _('卸载会删容器和镜像，数据目录保留。确定？') })
-				]));
+				]),
 
-				body.push(E('div', { 'class': 'cbi-map-descr' }, [
-					_('再点一次「安装」等于重拉镜像并重建容器，providers 和密钥都不丢。'),
-					E('br'),
+				E('div', { 'class': 'cbi-map-descr' }, [
 					_('客户端接入：ANTHROPIC_BASE_URL / OPENAI_BASE_URL 都填网关地址，'
-						+ 'key 用控制台里生成的 sk-magpie-…')
-				]));
-			}
-
-			return E('div', { 'class': 'cbi-section' }, body);
+						+ 'key 用控制台里生成的 sk-magpie-…'),
+					E('br'),
+					_('换镜像 tag 去上面「通用设置」改，改完点「重装镜像」生效。')
+				])
+			]);
 		}
 
 		/* 数据目录候选：只是 df，几百毫秒，但不能挡首屏 */
