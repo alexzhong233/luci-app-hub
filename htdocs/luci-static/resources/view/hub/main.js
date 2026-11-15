@@ -115,24 +115,57 @@ var PN_MODES = [
 	{ id: 'native', title: _('本地安装') }
 ];
 
-/* WorkBuddy2API 的两种装法，顺序与它自己那个页面一致 */
+/* WorkBuddy2API 的四种装法（两种来源 × 本地/容器），顺序与它自己那个页面一致 */
 var WB_MODES = [
 	{
 		id: 'python',
-		title: _('本地·Python'),
-		how: _('上游 OpenWrt 包（apk/ipk），Python 实现'),
+		kind: 'python',
+		src: 'official',
+		title: _('本地·原版'),
+		how: _('niyouqianma/workbuddy2api-hub 的 apk/ipk，Python 实现'),
 		notes: [
 			_('procd 托管 python3 -m wb_proxy，参数全部走 /etc/config/workbuddy2api。'),
 			_('会连带装 python3 等依赖，约 15MB 落在 overlay。'),
 			_('网关地址 http://<路由器IP>:<端口>/v1，看板在根路径。')
 		],
 		fieldLabel: _('版本'),
-		fieldHint: _('留空 = 上游最新 release，例如 v2.2.0')
+		fieldHint: _('留空 = 上游最新 release，例如 v2.1.3')
 	},
 	{
 		id: 'python-docker',
-		title: _('容器·Python'),
-		how: _('上游镜像 ghcr.io/m-strange/workbuddy2api-hub'),
+		kind: 'python-docker',
+		src: 'official',
+		title: _('容器·原版'),
+		how: _('ghcr.io/niyouqianma/workbuddy2api-hub'),
+		alert: _('原版上游只发 apk/ipk，ghcr 上没有这个镜像（docker-publish 从未跑过），'
+			+ '现在装会拉不动。要用容器版请选「容器·社区版」。'),
+		notes: [
+			_('docker compose 起 wb-proxy，host 网络，容器内端口就是宿主端口。'),
+			_('账号挂 /app/accounts、用量挂 /app/usage，都指向数据目录下的同一份。')
+		],
+		fieldLabel: _('镜像标签'),
+		fieldHint: _('留空 = 上游最新，例如 v2.1.3')
+	},
+	{
+		id: 'python-ce',
+		kind: 'python',
+		src: 'community',
+		title: _('本地·社区版'),
+		how: _('M-strange/workbuddy2api-hub 的 apk/ipk（社区接管分支）'),
+		notes: [
+			_('合并了社区 PR #813-#819，版本比原版新（当前 v2.2.0）。'),
+			_('程序与数据布局和原版完全一致：同一个 init.d、同一份 /etc/config/workbuddy2api。'),
+			_('也是 procd 托管 python3 -m wb_proxy，约 15MB 依赖落在 overlay。')
+		],
+		fieldLabel: _('版本'),
+		fieldHint: _('留空 = 上游最新 release，例如 v2.2.0')
+	},
+	{
+		id: 'python-docker-ce',
+		kind: 'python-docker',
+		src: 'community',
+		title: _('容器·社区版'),
+		how: _('ghcr.io/m-strange/workbuddy2api-hub'),
 		notes: [
 			_('docker compose 起 wb-proxy，host 网络，容器内端口就是宿主端口。'),
 			_('账号挂 /app/accounts、用量挂 /app/usage，都指向数据目录下的同一份。'),
@@ -720,6 +753,7 @@ return view.extend({
 				E('h3', {}, [ mode.title ]),
 				E('div', { 'class': 'cbi-map-descr' }, [ mode.how, E('br') ].concat(mode.notes))
 			];
+
 
 			/* 容器版固定 host：BT 要接大量入站连接，bridge 走 NAT 还得给 BT 端口
 			   单独做映射，出问题也难查。不给选项，省得选错了再来找原因。 */
@@ -1346,14 +1380,49 @@ return view.extend({
 
 		function wbF(st, id, name) { return st[wbSfx(id) + '_' + name]; }
 
-		function wbPresent(st, id) { return flag(wbF(st, id, 'present')); }
+		/* 「已装」= 物理实现对得上，且装在同一个来源（.wb2api-<kind>.source） */
+		function wbPresent(st, mode) {
+			var id = typeof mode === 'string' ? mode : mode.kind;
 
-		function wbRunningOf(st, id) { return flag(wbF(st, id, 'running')); }
+			if (!flag(wbF(st, id, 'present')))
+				return false;
 
-		function wbVersion(st, id) { return wbF(st, id, 'version') || ''; }
+			if (typeof mode === 'string')
+				return true;
 
-		function wbLatest(st) {
-			return st.latest_python || '';
+			return (wbF(st, id, 'source') || 'official') === mode.src;
+		}
+
+		function wbRunningOf(st, mode) { return flag(wbF(st, mode.kind || mode, 'running')); }
+
+		function wbVersion(st, mode) { return wbF(st, mode.kind || mode, 'version') || ''; }
+
+		function wbLatest(st, src) {
+			return st['latest_' + (src || 'official')] || '';
+		}
+
+		/* 已装的是哪个页签 */
+		function wbTabId(st) {
+			var kind = st.kind || 'none';
+
+			if (kind !== 'python' && kind !== 'python-docker')
+				return '';
+
+			return (st[wbSfx(kind) + '_source'] || 'official') === 'community' ? kind + '-ce' : kind;
+		}
+
+		/* 当前装的是哪一页签（物理实现 + 来源），标题用它 */
+		function wbLabel(st) {
+			var id = wbTabId(st);
+			var m = null;
+
+			WB_MODES.forEach(function(x) { if (x.id === id) m = x; });
+
+			if (m)
+				return m.title;
+
+			/* 遗留的 Rust 版没有对应页签，退回它的停更标题 */
+			return wbTitle((st && st.kind) || '');
 		}
 
 		/* 遗留的 Rust 版还认得出来，但已经不能装、不能更新 */
@@ -1381,7 +1450,7 @@ return view.extend({
 			var label = kind === 'none'
 				? _('WorkBuddy2API 未安装')
 				: (running ? _('WorkBuddy2API 正在运行（%s）') : _('WorkBuddy2API 已停止（%s）'))
-					.format(wbTitle(kind));
+					.format(wbLabel(st));
 
 			items.push([ _('状态'), E('div', { 'class': 'hub-head' }, [
 				E('button', {
@@ -1397,7 +1466,7 @@ return view.extend({
 
 			if (kind !== 'none') {
 				var cur = st.version || '';
-				var newv = flag(st.legacy) ? '' : wbLatest(st);
+				var newv = flag(st.legacy) ? '' : wbLatest(st, st[wbSfx(kind) + '_source']);
 				var cell = [ E('code', {}, [ cur ? 'v' + vnum(cur) : '—' ]) ];
 
 				if (newv && cur && vnum(newv) !== vnum(cur))
@@ -1424,7 +1493,7 @@ return view.extend({
 			items.push([ _('数据目录'), E('code', {}, [ st.datadir || '—' ]) ]);
 			items.push([ _('账号数'), [
 				E('code', {}, [ String(int(st.accounts)) ]),
-				muted(' ' + _('个 JSON（在 accounts/ 下，两种装法共用）'))
+				muted(' ' + _('个 JSON（在 accounts/ 下，四种装法共用）'))
 			] ]);
 			items.push([ _('用量体积'), mb(st.usagesize_kb) ]);
 			items.push([ _('数据盘剩余'), mb(st.data_free_kb) ]);
@@ -1457,7 +1526,7 @@ return view.extend({
 			return E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, [ _('通用设置') ]),
 				E('div', { 'class': 'cbi-map-descr' }, [
-					_('两种装法共用同一个数据目录和端口：accounts/ 里每个账号一个 JSON，usage/ 里是用量日志。'),
+					_('四种装法共用同一个数据目录和端口：accounts/ 里每个账号一个 JSON，usage/ 里是用量日志。'),
 					E('br'),
 					_('换实现只是换运行方式，账号和额度记录原地不动。'),
 					_('这两项在安装时生效：已装的话改完先卸载再装，或直接点「重启」让配置重新生成。')
@@ -1476,9 +1545,9 @@ return view.extend({
 
 		function wbOpsPane(st, mode) {
 			var inFlight = busy(parseTask(st.task).phase);
-			var running = wbRunningOf(st, mode.id);
-			var cur = wbVersion(st, mode.id);
-			var newv = flag(st.legacy) ? '' : wbLatest(st);
+			var running = wbRunningOf(st, mode);
+			var cur = wbVersion(st, mode);
+			var newv = wbLatest(st, mode.src);
 			var canUpdate = newv && cur && vnum(newv) !== vnum(cur);
 			var ops = [];
 
@@ -1549,8 +1618,9 @@ return view.extend({
 			var inFlight = busy(parseTask(st.task).phase);
 			var other = '';
 
+			/* 同一个实现的另一个来源不算冲突：装上去就是就地换源，ctl 允许 */
 			WB_MODES.forEach(function(m) {
-				if (!other && m.id !== mode.id && wbPresent(st, m.id))
+				if (!other && m.kind !== mode.kind && wbPresent(st, m))
 					other = m.id;
 			});
 
@@ -1591,10 +1661,10 @@ return view.extend({
 			if (blocked) {
 				var oname = other === 'legacy'
 					? wbTitle(flag(st.rust_present) ? 'rust' : 'rust-docker')
-					: modeOf(WB_MODES, other).title;
+					: (wbLabel(st) || modeOf(WB_MODES, other).title);
 				var ohint = other === 'legacy'
 					? _('它是已停更的 Rust 版，先卸掉（命令行 workbuddy2api-ctl remove rust 也行）再装新的。')
-					: _('二选一：同一时刻只能跑一个实现，装新的之前请先到「%s」页签把它卸载。').format(oname);
+					: _('四选一：本地和容器加起来只能跑一个，装新的之前请先到「%s」页签把它卸载。').format(oname);
 
 				body.push(alertBox(E('div', {}, [
 					E('strong', {}, [ _('已经装了「%s」').format(oname) ]),
@@ -1602,7 +1672,17 @@ return view.extend({
 				])));
 			}
 
-			if (mode.id === 'python' && !flag(st.pkgpython))
+			if (mode.alert)
+				body.push(alertBox(mode.alert));
+
+			/* 同一个实现装了另一个来源：装上去就是就地换源，数据不动 */
+			if (flag(wbF(st, mode.kind, 'present')) && !wbPresent(st, mode))
+				body.push(alertBox(E('div', {}, [
+					_('当前装的是「%s」。点下面的安装会把它换成「%s」，').format(wbLabel(st) || '—', mode.title),
+					_('端口和数据目录不变，accounts/ 与 usage/ 都保留。')
+				])));
+
+			if (mode.kind === 'python' && !flag(st.pkgpython))
 				body.push(alertBox(_('系统里没有 python3：安装时会从软件源拉 python3 等依赖（约 15MB），'
 					+ '需要联网和可用的 opkg/apk 源。')));
 
@@ -1633,10 +1713,10 @@ return view.extend({
 				state.sig = '';
 				drawAll(true);
 			}, function(m) {
-				return wbPresent(st, m.id) ? _('（已装）') : '';
+				return wbPresent(st, m) ? _('（已装）') : '';
 			}));
 			frag.appendChild(E('div', {}, [
-				wbPresent(st, mode.id) ? wbOpsPane(st, mode) : wbInstallPane(st, mode)
+				wbPresent(st, mode) ? wbOpsPane(st, mode) : wbInstallPane(st, mode)
 			]));
 
 			return frag;
@@ -1691,6 +1771,7 @@ return view.extend({
 				w.kind, w.running, w.task, w.version, w.port, w.accounts, w.listening,
 				w.python_present, w.python_docker_present, w.rust_present, w.rust_docker_present,
 				w.python_version, w.python_docker_version, w.rust_version, w.rust_docker_version,
+				w.python_source, w.python_docker_source, w.latest_official, w.latest_community,
 				h.mg_image, h.mg_ct, h.mg_running, h.mg_web_port, h.mg_web_busy,
 				h.mg_gw_busy, h.mg_datadir, h.mg_web_key, h.mg_owner_ok, h.mg_providers,
 				state.latest
@@ -1726,12 +1807,11 @@ return view.extend({
 			}
 
 			if (state.svc === 'wb' && !state.pinned.wb) {
-				var kind = state.wb.kind;
-				var hit = false;
+				/* 物理实现 + 来源才能定位页签；只按 kind 会永远落到「原版」那一栏 */
+				var want = wbTabId(state.wb);
 
-				WB_MODES.forEach(function(m) { if (m.id === kind) hit = true; });
-				if (hit)
-					state.mode.wb = kind;
+				if (want)
+					state.mode.wb = want;
 			}
 
 			drawSvcTabs();
@@ -2017,7 +2097,7 @@ return view.extend({
 				_('qBittorrent、OpenList、1Panel、WorkBuddy2API、Magpie 收在一个页面里。'),
 				E('br'),
 				_('每个服务都是「状态 → 通用设置 → 方式页签 → 安装/操作」：'),
-				_('qBittorrent 四种运行方式、OpenList 三种、1Panel 两种、WorkBuddy2API 两种，全部用页签切换。')
+				_('qBittorrent 四种运行方式、OpenList 三种、1Panel 两种、WorkBuddy2API 四种，全部用页签切换。')
 			]),
 			svcTabWrap,
 			contentWrap,

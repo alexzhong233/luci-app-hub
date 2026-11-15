@@ -1,25 +1,28 @@
 #!/bin/sh
-# WorkBuddy2API 在 OpenWrt 上的两种安装方式，二选一。
+# WorkBuddy2API 在 OpenWrt 上的四种安装方式，四选一（两种来源 × 本地/容器）。
 #
-#   本地·Python   python        官方 apk/ipk（纯 Python，带 python3 依赖）
-#   容器·Python   python-docker ghcr.io/m-strange/workbuddy2api-hub
+#   python            本地·原版    niyouqianma 的 apk/ipk（Python，带 python3 依赖）
+#   python-docker     容器·原版    ghcr.io/niyouqianma/workbuddy2api-hub
+#   python-ce         本地·社区版  M-strange/workbuddy2api-hub 的 apk/ipk
+#   python-docker-ce  容器·社区版  ghcr.io/m-strange/workbuddy2api-hub
 #
-# 两种装法共用同一个数据目录：$DATADIR/accounts（每账号一个 JSON）与
+# 两个上游装出来的是同一套程序（同一个 init.d、同一个 /etc/config/workbuddy2api、
+# 同一个数据目录），差别只在来源与版本：
+#   原版     niyouqianma/workbuddy2api-hub  —— 一直在出 release（当前 v2.1.3）
+#   社区版   M-strange/workbuddy2api-hub    —— 社区接管分支，合并 PR #813-#819（当前 v2.2.0）
+# 更早的两个上游 ardeyouxipianyi/workbuddy2api-hub 与 Rust 重写分支
+# YTjungle666/workbuddy2api-hub 都已删库，Rust 两套不再提供安装（只能识别 + 卸载）。
+#
+# 四种装法共用同一个数据目录：$DATADIR/accounts（每账号一个 JSON）与
 # $DATADIR/usage（用量日志）。切换实现只换运行方式，账号和额度记录都不动。
-# 端口 8788、目录同一份，所以同一时刻只能跑一个，ctl 里硬拦。
-#
-# 上游：M-strange/workbuddy2api-hub
-#   原 ardeyouxipianyi/workbuddy2api-hub 与 Rust 重写分支 YTjungle666/workbuddy2api-hub
-#   都已删库（API 404）；ghcr 上 ardeyouxipianyi 的镜像也已无权限拉取。所以这里
-#   只跟 M-strange 这个社区接管分支（合并 PR #813-#819，Python 实现 + OpenWrt 包 +
-#   ghcr 镜像全都有）。
-#
-#   Rust 两套（本地 / 容器）已经不再提供：上游仓库删除后拿不到版本号，也没了
-#   二进制产物。老机器上还留着的 wb-backend 或 ytjungle666 容器仍能被识别，
-#   可以用 remove 停掉并清干净。
+# 端口 8788、目录同一份，同一时刻只能跑一个（本地与容器互斥，两种来源也互斥）。
+# 装在哪种来源会记在 $DATADIR/.wb2api-<python|python-docker>.source 里，
+# 页面靠它决定哪个页签标「已装」。
 
-PY_REPO="M-strange/workbuddy2api-hub"
-PY_IMG="ghcr.io/m-strange/workbuddy2api-hub"
+REPO_OFFICIAL="niyouqianma/workbuddy2api-hub"
+REPO_COMMUNITY="M-strange/workbuddy2api-hub"
+IMG_OFFICIAL="ghcr.io/niyouqianma/workbuddy2api-hub"
+IMG_COMMUNITY="ghcr.io/m-strange/workbuddy2api-hub"
 
 CT_NAME="wb-proxy"
 TASK_DIR="/var/run/workbuddy2api-task"
@@ -38,6 +41,37 @@ PORT=$(uci -q get workbuddy2api.main.port)
 ACCOUNTS_DIR="$DATADIR/accounts"
 USAGE_DIR="$DATADIR/usage"
 COMPOSE_FILE="$DATADIR/docker-compose.yml"
+
+# ---------------------------------------------------------------- 变体映射
+# 四个 install id → 物理实现（本地 python / 容器）与来源（official / community）
+kind_of() {
+	case "$1" in
+		python | python-ce) echo "python" ;;
+		python-docker | python-docker-ce) echo "python-docker" ;;
+		*) echo "" ;;
+	esac
+}
+
+src_of() {
+	case "$1" in
+		*-ce) echo "community" ;;
+		*) echo "official" ;;
+	esac
+}
+
+repo_of() {
+	case "$1" in
+		community) echo "$REPO_COMMUNITY" ;;
+		*) echo "$REPO_OFFICIAL" ;;
+	esac
+}
+
+img_of() {
+	case "$1" in
+		community) echo "$IMG_COMMUNITY" ;;
+		*) echo "$IMG_OFFICIAL" ;;
+	esac
+}
 
 # ---------------------------------------------------------------- 基础工具
 arch_name() {
@@ -172,11 +206,20 @@ ct_image() {
 	docker inspect --format '{{.Config.Image}}' "$CT_NAME" 2>/dev/null
 }
 
+# 容器版：两种来源都算「已装」
 pd_present() {
 	case "$(ct_image)" in
-		*m-strange/workbuddy2api-hub*) return 0 ;;
+		*niyouqianma/workbuddy2api-hub* | *m-strange/workbuddy2api-hub*) return 0 ;;
 	esac
 	return 1
+}
+
+# 容器镜像属于哪个来源（认不出就空）
+pd_src() {
+	case "$(ct_image)" in
+		*m-strange/workbuddy2api-hub*) echo "community" ;;
+		*niyouqianma/workbuddy2api-hub*) echo "official" ;;
+	esac
 }
 
 # 遗留：Rust 版镜像（上游仓库已删除，只用于识别和清理）
@@ -193,6 +236,25 @@ ct_running() {
 
 port_listening() {
 	netstat -lnt 2>/dev/null | grep -q ":$1 "
+}
+
+# 装在哪种来源也记在数据目录里：同一个 init.d、同一个版本号，只能靠这个区分
+# 「原版」和「社区版」。老机器上没有这个文件时按 official 处理。
+src_file() {
+	echo "$DATADIR/.wb2api-$1.source"
+}
+
+read_src() {
+	local v
+
+	v=$(cat "$(src_file "$1")" 2>/dev/null)
+	[ -n "$v" ] || v="official"
+	echo "$v"
+}
+
+write_src() {
+	mkdir -p "$DATADIR" 2>/dev/null
+	echo "$2" >"$(src_file "$1")"
 }
 
 # 装完把版本记在数据目录里，跟着数据走：换实现、换目录都不会读错。
@@ -344,7 +406,8 @@ cmd_status() {
 	echo "variant=$kind"
 	echo "port=$PORT"
 	echo "datadir=$DATADIR"
-	echo "latest_python=$(cached_latest python)"
+	echo "latest_official=$(cached_latest official)"
+	echo "latest_community=$(cached_latest community)"
 	echo "task=$(task_phase)"
 	echo "arch=$(arch_name)"
 	echo "docker=$(docker_live && echo 1 || echo 0)"
@@ -358,10 +421,12 @@ cmd_status() {
 	echo "python_present=$py_p"
 	echo "python_running=$py_r"
 	echo "python_version=$(ver_python)"
+	echo "python_source=$([ "$py_p" = "1" ] && read_src python)"
 
 	echo "python_docker_present=$pd_p"
 	echo "python_docker_running=$pd_r"
 	echo "python_docker_version=$([ "$pd_p" = "1" ] && ver_ct)"
+	echo "python_docker_source=$([ "$pd_p" = "1" ] && { pd_src | grep . || read_src python-docker; })"
 
 	echo "rust_present=$rs_p"
 	echo "rust_running=$rs_r"
@@ -373,6 +438,13 @@ cmd_status() {
 
 	# 遗留的 Rust 版：上游删库后不再提供安装，但已经装上的仍要能看见、能清掉
 	echo "legacy=$([ "$rs_p" = "1" ] || [ "$rd_p" = "1" ] && echo 1 || echo 0)"
+
+	# 当前这一套的来源：页面用它决定哪个页签标「已装」
+	echo "source=$(case "$kind" in
+		python) read_src python ;;
+		python-docker) pd_src | grep . || read_src python-docker ;;
+		rust | rust-docker) echo "" ;;
+	esac)"
 
 	# 当前这一套的合并视图，页面直接用
 	case "$kind" in
@@ -404,19 +476,27 @@ cmd_status() {
 }
 
 cmd_latest() {
-	local which="$1" p
+	local which="$1" src p
 
 	mkdir -p "$TASK_DIR"
 
-	[ -z "$which" ] || [ "$which" = "all" ] || [ "$which" = "python" ] || return 0
+	case "$which" in
+		'' | all | official | community) ;;
+		python) which=official ;;
+		*) return 0 ;;
+	esac
 
-	p=$(gh_latest_release "$PY_REPO")
-	if [ -n "$p" ]; then
-		echo "$p" >"$TASK_DIR/latest-python"
-	else
-		p=$(cached_latest python)
-	fi
-	echo "python=$p"
+	for src in official community; do
+		[ -z "$which" ] || [ "$which" = "all" ] || [ "$which" = "$src" ] || continue
+
+		p=$(gh_latest_release "$(repo_of "$src")")
+		if [ -n "$p" ]; then
+			echo "$p" >"$TASK_DIR/latest-$src"
+		else
+			p=$(cached_latest "$src")
+		fi
+		echo "$src=$p"
+	done
 
 	return 0
 }
@@ -450,14 +530,18 @@ spawn_task() {
 # ---------------------------------------------------------------- 互斥检查
 # 返回 0 = 可以装；否则打印原因并返回 4
 check_exclusive() {
-	local want="$1"
+	local want kind
 
-	if [ "$want" != "python" ] && [ "$(py_present && echo 1)" = "1" ]; then
-		echo "已装「本地·Python」，二选一，请先卸载它。" >&2
+	want="$1"
+	kind=$(kind_of "$want")
+	[ -n "$kind" ] || kind="$want"
+
+	if [ "$kind" != "python" ] && py_present; then
+		echo "已装「本地」版（原版或社区版），四选一，请先卸载它。" >&2
 		return 4
 	fi
-	if [ "$want" != "python-docker" ] && pd_present; then
-		echo "已装「容器·Python」，二选一，请先卸载它。" >&2
+	if [ "$kind" != "python-docker" ] && pd_present; then
+		echo "已装「容器」版（原版或社区版），四选一，请先卸载它。" >&2
 		return 4
 	fi
 	# 遗留的 Rust 版也占着同一个端口和数据目录，装新的之前必须先清掉
@@ -475,7 +559,10 @@ check_exclusive() {
 
 # ---------------------------------------------------------------- 本地·Python
 worker_python() {
-	local tag="$1" port="$2" dir="$3" ver url tmp f mgr i=0
+	local tag="$1" port="$2" dir="$3" src="${4:-official}" ver url tmp f mgr i=0
+
+	# 版本号与来源都记在「这次装的目录」里，不是 uci 里可能过期的那个
+	DATADIR="$dir"
 
 	mgr=$(pkg_mgr)
 	[ -n "$mgr" ] || {
@@ -499,11 +586,11 @@ worker_python() {
 	case "$mgr" in
 		apk)
 			f="$tmp/workbuddy2api-$ver-r1.apk"
-			url="https://github.com/$PY_REPO/releases/download/$tag/workbuddy2api-$ver-r1.apk"
+			url="https://github.com/$(repo_of "$src")/releases/download/$tag/workbuddy2api-$ver-r1.apk"
 			;;
 		opkg)
 			f="$tmp/workbuddy2api_${ver}-1_all.ipk"
-			url="https://github.com/$PY_REPO/releases/download/$tag/workbuddy2api_${ver}-1_all.ipk"
+			url="https://github.com/$(repo_of "$src")/releases/download/$tag/workbuddy2api_${ver}-1_all.ipk"
 			;;
 	esac
 
@@ -545,6 +632,7 @@ worker_python() {
 	echo "== 写配置：端口 $port，数据目录 $dir"
 	save_cfg python "$port" "$dir"
 	write_ver python "$ver"
+	write_src python "$src"
 
 	[ -x "$PY_INIT" ] || {
 		set_phase "error:装完了但没有 $PY_INIT，包结构不对"
@@ -599,7 +687,7 @@ yaml_q() {
 }
 
 compose_write() {
-	local tag="$1" port="$2" dir="$3" tz
+	local tag="$1" port="$2" dir="$3" src="${4:-official}" tz
 
 	tz=$(uci -q get system.@system[0].zonename)
 	[ -n "$tz" ] || tz="Asia/Shanghai"
@@ -611,7 +699,7 @@ compose_write() {
 		echo "# 本地版与容器版共用 $dir 下的 accounts/ 与 usage/，换实现不丢数据。"
 		echo "services:"
 		echo "  $CT_NAME:"
-		echo "    image: $(yaml_q "$PY_IMG:${tag:-latest}")"
+		echo "    image: $(yaml_q "$(img_of "$src"):${tag:-latest}")"
 		echo "    container_name: $CT_NAME"
 		echo "    restart: unless-stopped"
 		echo "    # host 网络：容器内端口就是宿主端口，局域网直连，不用管桥接转发"
@@ -634,7 +722,10 @@ compose_write() {
 }
 
 worker_ct_up() {
-	local tag="$1" port="$2" dir="$3" i=0 img="$PY_IMG:${1:-latest}"
+	local tag="$1" port="$2" dir="$3" src="${4:-official}" i=0
+	local img="$(img_of "$src"):${1:-latest}"
+
+	DATADIR="$dir"
 
 	if compose_bin >/dev/null 2>&1; then
 		echo "== compose pull $img"
@@ -690,7 +781,7 @@ worker_ct_up() {
 # ---------------------------------------------------------------- 安装入口
 cmd_install() {
 	local variant="$1" port="$2" dir="$3" tag="$4"
-	local overlay_kb
+	local kind src overlay_kb
 
 	[ -n "$port" ] || port="$PORT"
 	[ -n "$dir" ] || dir="$DATADIR"
@@ -711,13 +802,11 @@ cmd_install() {
 			;;
 	esac
 
-	check_exclusive "$variant" || return 4
-
 	case "$variant" in
-		python | python-docker) ;;
+		python | python-docker | python-ce | python-docker-ce) ;;
 		rust | rust-docker)
 			echo "Rust 版已经不再提供：上游 YTjungle666/workbuddy2api-hub 已删库，" >&2
-			echo "拿不到版本号和二进制。旧的可以 remove 清掉，然后装 python 或 python-docker。" >&2
+			echo "拿不到版本号和二进制。旧的可以 remove 清掉，然后装下面四种之一。" >&2
 			return 1
 			;;
 		*)
@@ -726,49 +815,58 @@ cmd_install() {
 			;;
 	esac
 
+	check_exclusive "$variant" || return 4
+
+	kind=$(kind_of "$variant")
+	src=$(src_of "$variant")
+
 	mkdir -p "$dir/accounts" "$dir/usage" || {
 		echo "无法创建 $dir" >&2
 		return 1
 	}
 	chmod 700 "$dir/accounts" 2>/dev/null
 
-	# 首次安装可能换了目录，compose 文件要跟着走（否则写到 uci 里的旧目录去）
+	# 首次安装可能换了目录：compose 文件与 .version/.source 都跟着这次选的目录走
+	# （脚本顶部的 DATADIR 是从 uci 读的，这个进程里可能还是上一次的值）
+	DATADIR="$dir"
 	COMPOSE_FILE="$dir/docker-compose.yml"
 
-	case "$variant" in
+	case "$kind" in
 		python)
 			overlay_kb=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
 			if [ -n "$overlay_kb" ] && [ "$overlay_kb" -lt 102400 ]; then
 				echo "overlay 剩余不足 100MB（当前 $((overlay_kb / 1024))MB）。" >&2
-				echo "本地·Python 会连带装 python3 等约 15MB 依赖。" >&2
+				echo "本地版会连带装 python3 等约 15MB 依赖。" >&2
 				return 3
 			fi
-			[ -n "$tag" ] || tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || tag=$(gh_latest_release "$(repo_of "$src")")
 			[ -n "$tag" ] || {
 				echo "取不到上游版本号（GitHub 不通？）" >&2
 				return 1
 			}
 			save_cfg python "$port" "$dir"
-			spawn_task "downloading:$tag" "安装本地·Python $tag" \
-				_worker_python "$tag" "$port" "$dir"
+			write_src python "$src"
+			spawn_task "downloading:$tag" "安装$(label_of "$variant") $tag" \
+				_worker_python "$tag" "$port" "$dir" "$src"
 			;;
 		python-docker)
 			docker_live || {
 				echo "Docker 没在跑，容器版装不了。" >&2
 				return 1
 			}
-			[ -n "$tag" ] || tag=$(gh_latest_release "$PY_REPO")
+			[ -n "$tag" ] || tag=$(gh_latest_release "$(repo_of "$src")")
 			[ -n "$tag" ] || {
 				echo "取不到上游版本号（GitHub 不通？）" >&2
 				return 1
 			}
-			compose_write "$tag" "$port" "$dir" || {
+			compose_write "$tag" "$port" "$dir" "$src" || {
 				echo "写不了 $COMPOSE_FILE" >&2
 				return 1
 			}
 			save_cfg python-docker "$port" "$dir"
-			spawn_task "pulling:$tag" "安装容器·Python $tag" \
-				_worker_ct_up "$tag" "$port" "$dir"
+			write_src python-docker "$src"
+			spawn_task "pulling:$tag" "安装$(label_of "$variant") $tag" \
+				_worker_ct_up "$tag" "$port" "$dir" "$src"
 			;;
 	esac
 
@@ -777,44 +875,58 @@ cmd_install() {
 
 # ---------------------------------------------------------------- 更新
 cmd_update() {
-	local variant="$1" tag
+	local variant="$1" kind src tag st
 
-	[ -n "$variant" ] || variant=$(cmd_status | sed -n 's/^kind=//p')
-	case "$variant" in
+	if [ -z "$variant" ]; then
+		st=$(cmd_status)
+		kind=$(echo "$st" | sed -n 's/^kind=//p')
+		src=$(echo "$st" | sed -n 's/^source=//p')
+		case "$kind" in
+			python | python-docker)
+				[ "$src" = "community" ] && variant="$kind-ce" || variant="$kind"
+				;;
+		esac
+	fi
+
+	kind=$(kind_of "$variant")
+	if [ -z "$kind" ]; then
+		echo "没有安装任何一套，或安装方式不认识：$variant" >&2
+		return 1
+	fi
+	src=$(src_of "$variant")
+
+	case "$kind" in
 		python)
 			py_present || {
-				echo "没装本地·Python" >&2
+				echo "没装本地版" >&2
 				return 1
 			}
-			tag=$(gh_latest_release "$PY_REPO")
+			tag=$(gh_latest_release "$(repo_of "$src")")
 			[ -n "$tag" ] || {
 				echo "取不到上游版本号" >&2
 				return 1
 			}
-			if [ "$(vnum "$tag")" = "$(ver_python)" ]; then
+			if [ "$(vnum "$tag")" = "$(ver_python)" ] && [ "$(read_src python)" = "$src" ]; then
 				echo "已经是最新版：$(ver_python)"
 				return 0
 			fi
-			spawn_task "downloading:$tag" "升级本地·Python 到 $tag" \
-				_worker_python "$tag" "$PORT" "$DATADIR"
+			spawn_task "downloading:$tag" "升级$(label_of "$variant") 到 $tag" \
+				_worker_python "$tag" "$PORT" "$DATADIR" "$src"
 			;;
 		python-docker)
 			pd_present || {
-				echo "没装容器·Python" >&2
+				echo "没装容器版" >&2
 				return 1
 			}
-			tag=$(gh_latest_release "$PY_REPO")
+			tag=$(gh_latest_release "$(repo_of "$src")")
 			[ -n "$tag" ] || {
 				echo "取不到上游版本号" >&2
 				return 1
 			}
-			compose_write "$tag" "$PORT" "$DATADIR"
-			spawn_task "pulling:$tag" "升级容器·Python 到 $tag" \
-				_worker_ct_up "$tag" "$PORT" "$DATADIR"
-			;;
-		*)
-			echo "没有安装任何一套" >&2
-			return 1
+			compose_write "$tag" "$PORT" "$DATADIR" "$src"
+			write_src python-docker "$src"
+			spawn_task "pulling:$tag" "升级$(label_of "$variant") 到 $tag" \
+				_worker_ct_up "$tag" "$PORT" "$DATADIR" "$src"
 			;;
 	esac
 
@@ -826,9 +938,9 @@ cmd_lifecycle() {
 	local variant="$1" act="$2"
 
 	case "$variant" in
-		python)
+		python | python-ce)
 			[ -x "$PY_INIT" ] || {
-				echo "没装本地·Python" >&2
+				echo "没装本地版" >&2
 				return 1
 			}
 			[ "$act" = "start" ] && "$PY_INIT" enable >/dev/null 2>&1
@@ -842,7 +954,7 @@ cmd_lifecycle() {
 			[ "$act" = "start" ] && "$RS_INIT" enable >/dev/null 2>&1
 			"$RS_INIT" "$act" 2>&1
 			;;
-		python-docker | rust-docker)
+		python-docker | python-docker-ce | rust-docker)
 			ct_running >/dev/null 2>&1 || [ -n "$(ct_state)" ] || {
 				echo "没有 wb-proxy 容器" >&2
 				return 1
@@ -855,7 +967,7 @@ cmd_lifecycle() {
 			case "$tag" in
 				'' | */*) tag=latest ;;
 			esac
-			compose_write "$tag" "$PORT" "$DATADIR" || return 1
+			compose_write "$tag" "$PORT" "$DATADIR" "$(read_src python-docker)" || return 1
 			case "$act" in
 				start | restart)
 					if compose_bin >/dev/null 2>&1; then
@@ -888,26 +1000,26 @@ cmd_remove() {
 	dir="$DATADIR"
 
 	case "$variant" in
-		python)
+		python | python-ce)
 			[ -x "$PY_INIT" ] && "$PY_INIT" stop >/dev/null 2>&1
 			[ -x "$PY_INIT" ] && "$PY_INIT" disable >/dev/null 2>&1
 			case "$(pkg_mgr)" in
 				apk) apk del workbuddy2api 2>&1 ;;
 				opkg) opkg remove workbuddy2api 2>&1 ;;
 			esac
-			rm -f "$(ver_file python)"
+			rm -f "$(ver_file python)" "$(src_file python)"
 			;;
 		rust)
 			[ -x "$RS_INIT" ] && "$RS_INIT" stop >/dev/null 2>&1
 			[ -x "$RS_INIT" ] && "$RS_INIT" disable >/dev/null 2>&1
 			rm -f "$RUST_BIN" "$(ver_file rust)"
 			;;
-		python-docker | rust-docker)
+		python-docker | python-docker-ce | rust-docker)
 			if compose_bin >/dev/null 2>&1 && [ -f "$COMPOSE_FILE" ]; then
 				compose down >/dev/null 2>&1
 			fi
 			docker rm -f "$CT_NAME" >/dev/null 2>&1
-			rm -f "$COMPOSE_FILE"
+			rm -f "$COMPOSE_FILE" "$(src_file python-docker)"
 			;;
 		*)
 			echo "未知的安装方式：$variant" >&2
@@ -917,7 +1029,7 @@ cmd_remove() {
 
 	if [ "$purge" = "purge" ]; then
 		rm -rf "$dir/accounts" "$dir/usage" "$dir/subbridge-data"
-		rm -f "$dir"/.wb2api-*.version
+		rm -f "$dir"/.wb2api-*.version "$dir"/.wb2api-*.source
 		echo "已卸载并删除数据：$dir"
 	else
 		echo "已卸载，数据保留在：$dir"
@@ -936,7 +1048,7 @@ cmd_logs() {
 	fi
 
 	case "$variant" in
-		python | rust)
+		python | python-ce | rust)
 			echo "== 服务日志 =="
 			logread 2>/dev/null | grep -iE "workbuddy|wb-proxy|wb-backend" | tail -n 40
 			;;
@@ -963,13 +1075,15 @@ case "${1:-}" in
 		cat >&2 <<-EOF
 			用法：workbuddy2api-ctl <命令>
 
-			  status                  两种装法的完整状态
-			  latest [python|all]     查上游最新版本
-			  disks                   /mnt 下的数据目录候选
+			  status                          四套的完整状态
+			  latest [official|community|all]  查两个上游的最新版本
+			  disks                           /mnt 与 /opt 下的数据目录候选
 
 			  install <安装方式> [端口] [数据目录] [版本]
-			    本地·Python    python
-			    容器·Python    python-docker
+			    本地·原版      python
+			    容器·原版      python-docker
+			    本地·社区版    python-ce
+			    容器·社区版    python-docker-ce
 
 			  update <安装方式>
 			  start|stop|restart <安装方式>

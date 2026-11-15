@@ -7,7 +7,7 @@
 | **qBittorrent** | 原生官方版 · 原生增强版（EE，反吸血） · 容器官方版 · 容器增强版 |
 | **OpenList** | openlist2（sbwml，运行时下载预编译包） · feeds 官方版 · 容器版 |
 | **1Panel** | 容器版 · 本地版 |
-| **WorkBuddy2API** | 本地 Python · 容器 Python |
+| **WorkBuddy2API** | 本地原版 · 容器原版 · 本地社区版 · 容器社区版 |
 | **Magpie** | 容器版（AI 模型网关，只有这一种） |
 
 五个页签都是完整的安装 / 更新 / 启停 / 卸载 / 日志，不用再去别的页面。
@@ -23,11 +23,15 @@
 ```
 
 **运行方式一律用页签，不用下拉框**：qBittorrent 4 个、OpenList 3 个、1Panel 2 个、
-WorkBuddy2API 2 个。通用设置常驻，装完也不消失，改端口、改数据目录随时可以。
+WorkBuddy2API 4 个。通用设置常驻，装完也不消失，改端口、改数据目录随时可以。
 
-WorkBuddy2API 只跟 `M-strange/workbuddy2api-hub`（社区接管分支）：原来那两个上游仓库
-（`ardeyouxipianyi` 与 Rust 重写分支 `YTjungle666`）都已删库，Rust 两套随之停掉。
-老机器上残留的 `wb-backend` / `ytjungle666` 容器仍能被识别，页面只给停用和卸载。
+WorkBuddy2API 现在是两种来源 × 本地/容器四种装法：原版跟
+`niyouqianma/workbuddy2api-hub`（v2.1.3），社区版跟 `M-strange/workbuddy2api-hub`
+（社区接管分支，v2.2.0）。两套装出来是同一个 init.d、同一份 uci、同一个数据目录，
+靠数据目录里的 `.wb2api-<实现>.source` 区分页签。**容器·原版暂时装不了** ——
+原版仓库没发过镜像（`docker-publish.yml` 从未运行，ghcr 404），页签留着但会拉失败。
+更早的 `ardeyouxipianyi` 与 Rust 分支 `YTjungle666` 都已删库，Rust 两套只保留
+识别与卸载，老机器上残留的 `wb-backend` / `ytjungle666` 容器页面只给停用和卸载。
 
 Magpie 是唯一例外：它只有容器版（Go 单体，官方只发多架构镜像，没有 OpenWrt 包），
 所以没有方式页签 —— 只有一个选项的页签比没有更烦人。其余结构完全一致。
