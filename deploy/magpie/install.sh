@@ -138,6 +138,8 @@ services:
     # host：等同路由器本机进程，出网由 Nikki 按域名分流。
     # 换成 bridge 会撞 Nikki 的 prerouting 劫持 —— TCP 直接被拒，连不上任何 provider。
     network_mode: host
+    cpus: "1.50"
+    mem_limit: 768m
     environment:
       TZ: Asia/Shanghai
       MAGPIE_WEB_KEY: "${MAGPIE_WEB_KEY}"

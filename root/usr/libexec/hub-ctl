@@ -461,6 +461,8 @@ qb_compose_write() {
 		echo "    container_name: $QBT_CT"
 		echo "    hostname: qbittorrent"
 		echo "    restart: unless-stopped"
+		echo "    cpus: '1.50'"
+		echo "    mem_limit: 512m"
 		if [ "$net" = "host" ]; then
 			echo "    network_mode: host"
 		else
@@ -1137,6 +1139,8 @@ ol_compose_write() {
 		echo "    image: $(yaml_q "$img")"
 		echo "    container_name: $OL_CT"
 		echo "    restart: unless-stopped"
+		echo "    cpus: '1.00'"
+		echo "    mem_limit: 512m"
 		case "$net" in
 		host)
 			echo "    network_mode: host"
@@ -1470,6 +1474,8 @@ mg_compose_write() {
 		echo "    # host：等同路由器本机进程，出网由 Nikki 按域名分流。"
 		echo "    # 换 bridge 会撞劫持，连不上任何 provider。"
 		echo "    network_mode: host"
+		echo "    cpus: '1.50'"
+		echo "    mem_limit: 768m"
 		echo "    environment:"
 		echo "      TZ: $(yaml_q "$(uci -q get system.@system[0].zonename || echo Asia/Shanghai)")"
 		echo "      MAGPIE_WEB_KEY: $(yaml_q "$key")"
