@@ -8,7 +8,7 @@
 #   luci       原生官方包 qbittorrent（feeds）
 #   luci-ee    原生增强版 qbittorrent-enhanced-edition（同二进制名、同一份 init）
 #   docker     容器官方版 lscr.io/linuxserver/qbittorrent
-#   docker-ee  容器增强版 p3terx/qbittorrent-enhanced
+#   docker-ee  容器增强版 superng6/qbittorrentee
 #
 # OpenList
 #   feeds      官方 openlist 包，数据 /etc/openlist
@@ -29,6 +29,7 @@ TASK_DIR="/var/run/hub-task"
 QBT_IMG_STD="lscr.io/linuxserver/qbittorrent:latest"
 QBT_IMG_EE="superng6/qbittorrentee:latest"
 OL_IMG="openlistteam/openlist:latest"
+MG_IMG="ghcr.io/yetone/magpie:latest"
 
 QBT_CT="qbittorrent"
 OL_CT="openlist"

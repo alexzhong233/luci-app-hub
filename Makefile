@@ -13,7 +13,7 @@ LUCI_DESCRIPTION:=五个服务收进一个页面，页签切换。qBittorrent �
 数据目录优先挂 /mnt/sda1，刷机不丢。
 LUCI_PKGARCH:=all
 # bash 是 1Panel 本地版的硬依赖（官方 install.sh 与生成的 1pctl 都是 bash），
-# yq 用于 OpenList 容器版的配置校验，curl 用于版本探测与镜像拉取。
+# curl 用于版本探测、包拉取与接口状态检查。
 LUCI_DEPENDS:=+luci-base +bash +curl
 
 include $(TOPDIR)/feeds/luci/luci.mk
